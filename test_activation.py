@@ -45,21 +45,21 @@ def main():
         temperature=0.8,
         top_p=0.95,
         max_tokens=50,
-        # extract_activations=True,
-        # activation_layers=[0, 5, 10],  # Extract from layers 0, 5, and 10
+        extract_activations=True,
+        activation_layers=[5, ],  # Extract from layers 0, 5, and 10
     )
 
     # Generate with activation extraction
     prompts = ["What's the capital of France?"]
     outputs = llm.generate(prompts, sampling_params)
 
-    # # Access activations
-    # for output in outputs:
-    #     for completion in output.outputs:
-    #         if completion.activations:
-    #             print(f"Available activation layers: {completion.activations.keys()}")
-    #             for layer_idx, activation in completion.activations.items():
-    #                 print(f"Layer {layer_idx} activation shape: {activation.shape}")
+    # Access activations
+    for output in outputs:
+        for completion in output.outputs:
+            if completion.activations:
+                print(f"Available activation layers: {completion.activations.keys()}")
+                for layer_idx, activation in completion.activations.items():
+                    print(f"Layer {layer_idx} activation shape: {activation.shape}")
 
     for output in outputs:
         print(f"Prompt: {output.prompt}")
