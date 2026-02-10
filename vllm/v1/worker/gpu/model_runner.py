@@ -940,71 +940,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     all_layer_indices = None
                     break
 
-        # Run model with activation collection if needed
+        # Set up model-specific activation capture if supported
+        use_model_specific_activations = needs_activations and hasattr(
+            self.model, "set_aux_hidden_state_layers"
+        )
+        if use_model_specific_activations:
+            layer_indices = (
+                tuple(sorted(all_layer_indices))
+                if all_layer_indices is not None
+                else tuple(range(len(self.model.model.layers)))
+            )
+            self.model.set_aux_hidden_state_layers(layer_indices)
+
+        # Set up hook-based activation capture as fallback
+        use_hook_activations = needs_activations and not use_model_specific_activations
+        activation_collector = None
+        if use_hook_activations:
+            activation_collector = ActivationCollector(self.model, all_layer_indices)
+            activation_collector.register_hooks()
+
+        # Run the model
         collected_activations: dict[int, torch.Tensor] = {}
-        if needs_activations:
-            try:
-                # Use activation collector as context manager
-                with ActivationCollector(self.model, all_layer_indices) as collector:
-                    if cudagraph_mode == CUDAGraphMode.FULL:
-                        # Run CUDA graph.
-                        # NOTE(woosuk): Here, we don't need to pass the input tensors,
-                        # because they are already copied to the CUDA graph input buffers.
-                        hidden_states = self.cudagraph_manager.run(
-                            input_batch.num_tokens_after_padding
-                        )
-                    else:
-                        # Run PyTorch model in eager mode.
-                        # TODO(woosuk): Support piecewise CUDA graph.
-                        with set_forward_context(
-                            input_batch.attn_metadata,
-                            self.vllm_config,
-                            num_tokens=input_batch.num_tokens_after_padding,
-                            cudagraph_runtime_mode=cudagraph_mode,
-                            num_tokens_across_dp=num_tokens_across_dp,
-                        ):
-                            hidden_states = self.model(
-                                input_ids=input_batch.input_ids,
-                                positions=input_batch.positions,
-                            )
-                    # Collect activations after forward pass
-                    collected_activations = collector.get_activations()
-            except Exception as e:
-                logger.error(
-                    f"Error during activation collection: {e}. "
-                    "Continuing without activations.",
-                    exc_info=True,
-                )
-                collected_activations = {}
-                # Still need to run the model if we haven't already
-                if cudagraph_mode == CUDAGraphMode.FULL:
-                    hidden_states = self.cudagraph_manager.run(
-                        input_batch.num_tokens_after_padding
-                    )
-                else:
-                    with set_forward_context(
-                        input_batch.attn_metadata,
-                        self.vllm_config,
-                        num_tokens=input_batch.num_tokens_after_padding,
-                        cudagraph_runtime_mode=cudagraph_mode,
-                        num_tokens_across_dp=num_tokens_across_dp,
-                    ):
-                        hidden_states = self.model(
-                            input_ids=input_batch.input_ids,
-                            positions=input_batch.positions,
-                        )
-        else:
-            # Normal execution without activation collection
+        try:
             if cudagraph_mode == CUDAGraphMode.FULL:
-                # Run CUDA graph.
-                # NOTE(woosuk): Here, we don't need to pass the input tensors,
-                # because they are already copied to the CUDA graph input buffers.
                 hidden_states = self.cudagraph_manager.run(
                     input_batch.num_tokens_after_padding
                 )
             else:
-                # Run PyTorch model in eager mode.
-                # TODO(woosuk): Support piecewise CUDA graph.
                 with set_forward_context(
                     input_batch.attn_metadata,
                     self.vllm_config,
@@ -1016,6 +978,36 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                         input_ids=input_batch.input_ids,
                         positions=input_batch.positions,
                     )
+
+            # Collect activations from model-specific path
+            if use_model_specific_activations:
+                if isinstance(hidden_states, tuple):
+                    hidden_states, aux_hidden_states = hidden_states
+                    collected_activations = {
+                        layer_indices[i]: aux_hidden_states[i]
+                        for i in range(len(aux_hidden_states))
+                    }
+                self.model.set_aux_hidden_state_layers(())
+
+            # Collect activations from hook-based path
+            if use_hook_activations and activation_collector is not None:
+                collected_activations = activation_collector.get_activations()
+        except Exception as e:
+            if needs_activations:
+                logger.error(
+                    "Error during activation collection: %s. "
+                    "Continuing without activations.",
+                    e,
+                    exc_info=True,
+                )
+                collected_activations = {}
+            else:
+                raise
+        finally:
+            if activation_collector is not None:
+                activation_collector.remove_hooks()
+            if use_model_specific_activations:
+                self.model.set_aux_hidden_state_layers(())
 
         # Use original 3-tuple format when activations are disabled
         if needs_activations:
