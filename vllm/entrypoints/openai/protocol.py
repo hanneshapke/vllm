@@ -88,6 +88,14 @@ logger = init_logger(__name__)
 _LONG_INFO = torch.iinfo(torch.long)
 
 
+def _serialize_activations(
+    activations: dict[int, torch.Tensor] | None,
+) -> dict[str, list[float]] | None:
+    if activations is None:
+        return None
+    return {str(k): v.flatten().tolist() for k, v in activations.items()}
+
+
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does allow extra fields
     model_config = ConfigDict(extra="allow")
@@ -753,6 +761,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    extract_activations: bool = Field(
+        default=False,
+        description="If true, return intermediate layer activations.",
+    )
+    activation_layers: list[int] | None = Field(
+        default=None,
+        description=(
+            "Layer indices to extract activations from. None means all layers."
+        ),
+    )
+    activation_type: str = Field(
+        default="hidden_states",
+        description="Type of activations to extract: 'hidden_states'.",
+    )
+
     # --8<-- [end:chat-completion-extra-params]
 
     # Default sampling parameters for chat completion requests
@@ -845,6 +868,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self.extract_activations:
+            extra_args["extract_activations"] = True
+            if self.activation_layers is not None:
+                extra_args["activation_layers"] = self.activation_layers
+            if self.activation_type != "hidden_states":
+                extra_args["activation_type"] = self.activation_type
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -1187,6 +1216,21 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    extract_activations: bool = Field(
+        default=False,
+        description="If true, return intermediate layer activations.",
+    )
+    activation_layers: list[int] | None = Field(
+        default=None,
+        description=(
+            "Layer indices to extract activations from. None means all layers."
+        ),
+    )
+    activation_type: str = Field(
+        default="hidden_states",
+        description="Type of activations to extract: 'hidden_states'.",
+    )
+
     # --8<-- [end:completion-extra-params]
 
     # Default sampling parameters for completion requests
@@ -1287,6 +1331,12 @@ class CompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+        if self.extract_activations:
+            extra_args["extract_activations"] = True
+            if self.activation_layers is not None:
+                extra_args["activation_layers"] = self.activation_layers
+            if self.activation_type != "hidden_states":
+                extra_args["activation_type"] = self.activation_type
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -1429,6 +1479,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
+    activations: dict[str, list[float]] | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -1560,6 +1611,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
+    activations: dict[str, list[float]] | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):

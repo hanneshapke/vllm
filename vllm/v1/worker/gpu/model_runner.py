@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.activation_collector import ActivationCollector
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
@@ -60,7 +61,6 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import apply_grammar_bitmask
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.activation_collector import ActivationCollector
 
 logger = init_logger(__name__)
 
@@ -922,49 +922,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata = None
 
         # Check if any request needs activation extraction
-        # Check all requests in the current batch (both new and cached)
         needs_activations = False
         all_layer_indices: set[int] | None = None
         req_ids_needing_activations: set[str] = set()
         if not dummy_run and sampling_metadata is not None and input_batch is not None:
-            try:
-                # Check ALL scheduled requests (both new and cached)
-                # Check all req_ids in the batch and get activation settings from extra_data
-                logger.info(
-                    f"Checking activation extraction for {len(input_batch.req_ids)} requests: {input_batch.req_ids}"
-                )
-                for req_id in input_batch.req_ids:
-                    extra_data = self.req_states.extra_data.get(req_id)
-                    if extra_data is None:
-                        logger.info(f"  req_id {req_id}: No extra_data found")
-                        continue
-                    logger.info(
-                        f"  req_id {req_id}: extra_data.extract_activations={extra_data.extract_activations}, "
-                        f"layers={extra_data.activation_layers}"
-                    )
-                    if extra_data.extract_activations:
-                        needs_activations = True
-                        req_ids_needing_activations.add(req_id)
-                        if extra_data.activation_layers:
-                            if all_layer_indices is None:
-                                all_layer_indices = set()
-                            all_layer_indices.update(extra_data.activation_layers)
-                        else:
-                            all_layer_indices = None  # Collect all layers
-                            break
-                        
-                logger.info(
-                    f"✓ Activation extraction check result: needs_activations={needs_activations}, "
-                    f"req_ids={req_ids_needing_activations}, layers={all_layer_indices}"
-                )
-                        
-            except Exception as e:
-                logger.warning(
-                    f"Error checking activation extraction requests: {e}. "
-                    "Skipping activation extraction.",
-                    exc_info=True,
-                )
-                needs_activations = False
+            for req_id in input_batch.req_ids:
+                extra_data = self.req_states.extra_data.get(req_id)
+                if extra_data is None or not extra_data.extract_activations:
+                    continue
+                needs_activations = True
+                req_ids_needing_activations.add(req_id)
+                if extra_data.activation_layers:
+                    if all_layer_indices is None:
+                        all_layer_indices = set()
+                    all_layer_indices.update(extra_data.activation_layers)
+                else:
+                    all_layer_indices = None
+                    break
 
         # Run model with activation collection if needed
         collected_activations: dict[int, torch.Tensor] = {}
@@ -1106,12 +1080,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     end_idx = query_start_loc[req_idx + 1].item()
                     for layer_idx, activation in collected_activations.items():
                         # Slice activation for this request and move to CPU
-                        req_activation = activation[start_idx:end_idx].cpu().contiguous()
+                        req_activation = (
+                            activation[start_idx:end_idx].cpu().contiguous()
+                        )
                         req_activations[layer_idx] = req_activation
                     activations_dict[req_id] = req_activations
-            logger.info(
-                f"✓ Collected activations for {len(activations_dict)} requests: {list(activations_dict.keys())}"
-            )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(

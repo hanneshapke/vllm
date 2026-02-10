@@ -50,6 +50,7 @@ from vllm.entrypoints.openai.protocol import (
     RequestResponseMetadata,
     ToolCall,
     UsageInfo,
+    _serialize_activations,
 )
 from vllm.entrypoints.openai.serving_chat_stream_harmony import (
     extract_harmony_streaming_delta,
@@ -1429,6 +1430,9 @@ class OpenAIServingChat(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
+                    activations=_serialize_activations(output.activations)
+                    if request.extract_activations
+                    else None,
                 )
                 choices.append(choice_data)
                 continue
@@ -1587,6 +1591,9 @@ class OpenAIServingChat(OpenAIServing):
                 token_ids=(
                     as_list(output.token_ids) if request.return_token_ids else None
                 ),
+                activations=_serialize_activations(output.activations)
+                if request.extract_activations
+                else None,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 
