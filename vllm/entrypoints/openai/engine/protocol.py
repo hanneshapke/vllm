@@ -119,7 +119,10 @@ def _serialize_activations(
 ) -> dict[str, list[float]] | None:
     if activations is None:
         return None
-    return {str(k): v.flatten().tolist() for k, v in activations.items()}
+    return {
+        str(k): torch.nan_to_num(v.flatten(), nan=0.0).tolist()
+        for k, v in activations.items()
+    }
 
 
 class JsonSchemaResponseFormat(OpenAIBaseModel):
