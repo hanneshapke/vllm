@@ -3576,9 +3576,29 @@ class GPUModelRunner(
                     positions = self.extract_activation_positions
                     for aux_idx, pos in positions.items():
                         orig_layer = extract_layer_map[aux_idx]
-                        self.collected_activations[orig_layer] = aux_hidden_states[
-                            pos
-                        ].detach()
+                        act = aux_hidden_states[pos]
+                        logger.info(
+                            "Activation layer %d (aux_idx=%d, pos=%d): "
+                            "shape=%s, dtype=%s, nan=%d, inf=%d, "
+                            "min=%.4f, max=%.4f, mean=%.4f",
+                            orig_layer,
+                            aux_idx,
+                            pos,
+                            act.shape,
+                            act.dtype,
+                            torch.isnan(act).sum().item(),
+                            torch.isinf(act).sum().item(),
+                            act.min().item()
+                            if not torch.all(torch.isnan(act))
+                            else float("nan"),
+                            act.max().item()
+                            if not torch.all(torch.isnan(act))
+                            else float("nan"),
+                            act.mean().item()
+                            if not torch.all(torch.isnan(act))
+                            else float("nan"),
+                        )
+                        self.collected_activations[orig_layer] = act.detach()
             else:
                 # Common case.
                 hidden_states = model_output
