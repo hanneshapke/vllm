@@ -202,7 +202,7 @@ class ModelConfig:
     """Layer indices to extract activations from. When set, the model captures
     intermediate hidden states at the specified layers during every forward
     pass, using the built-in aux_hidden_state mechanism. Activations are
-    returned in API responses when requested via extract_activation_layers
+    returned in API responses when requested via extract_activations=true
     in the request body."""
     max_logprobs: int = 20
     """Maximum number of log probabilities to return when `logprobs` is

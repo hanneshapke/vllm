@@ -177,8 +177,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
 
         # Activation extraction state.
-        # req_id -> layer indices to extract
-        self._activation_reqs: dict[str, list[int]] = {}
+        # req_ids that want activations
+        self._activation_reqs: set[str] = set()
         self._collected_activations: dict[int, torch.Tensor] = {}
         self._req_ids_needing_activations: set[str] = set()
 
@@ -439,7 +439,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_runner.remove_request(req_id)
             self.prompt_logprobs_worker.remove_request(req_id)
             self.lora_state.remove_request(req_id)
-            self._activation_reqs.pop(req_id, None)
+            self._activation_reqs.discard(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.supports_mm_inputs:
@@ -486,9 +486,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Track activation extraction config.
             sp = new_req_data.sampling_params
-            layers = getattr(sp, "extract_activation_layers", None) if sp else None
-            if layers is not None:
-                self._activation_reqs[req_id] = layers
+            if sp and getattr(sp, "extract_activations", False):
+                self._activation_reqs.add(req_id)
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -890,24 +889,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Check if any request needs activation extraction.
         needs_activations = False
-        all_layer_indices: set[int] | None = None
         req_ids_needing_activations: set[str] = set()
         if not dummy_run and input_batch is not None:
             for req_id in input_batch.req_ids:
-                layers = self._activation_reqs.get(req_id)
-                if layers is None:
-                    continue
-                needs_activations = True
-                req_ids_needing_activations.add(req_id)
-                if all_layer_indices is None:
-                    all_layer_indices = set()
-                all_layer_indices.update(layers)
+                if req_id in self._activation_reqs:
+                    needs_activations = True
+                    req_ids_needing_activations.add(req_id)
 
         # Set up activation capture hooks (only in eager mode).
         activation_collector = None
         if needs_activations and not use_cudagraph:
-            activation_collector = ActivationCollector(self.model, all_layer_indices)
-            activation_collector.register_hooks()
+            configured_layers = self.model_config.extract_activation_layers
+            if configured_layers:
+                activation_collector = ActivationCollector(
+                    self.model, set(configured_layers)
+                )
+                activation_collector.register_hooks()
 
         # Run model.
         try:

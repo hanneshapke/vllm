@@ -3524,35 +3524,13 @@ class GPUModelRunner(
         # Here we just track which request IDs want activations.
         req_ids_needing_activations: set[str] = set()
         extract_layer_map = getattr(self, "extract_activation_layer_map", None)
-        configured_layers = (
-            set(extract_layer_map.values()) if extract_layer_map else set()
-        )
-        for req_id in req_ids:
-            req_state = self.requests.get(req_id)
-            if not (req_state and req_state.sampling_params):
-                continue
-            layers = getattr(
-                req_state.sampling_params, "extract_activation_layers", None
-            )
-            if layers is None:
-                continue
-            if not configured_layers:
-                logger.warning_once(
-                    "Request asks for activation layers %s but no layers "
-                    "were configured at startup. Use "
-                    "--extract-activation-layers to configure.",
-                    layers,
-                )
-                continue
-            unconfigured = set(layers) - configured_layers
-            if unconfigured:
-                logger.warning_once(
-                    "Request asks for activation layers %s but only %s "
-                    "are configured. Unconfigured layers will be ignored.",
-                    sorted(unconfigured),
-                    sorted(configured_layers),
-                )
-            req_ids_needing_activations.add(req_id)
+        if extract_layer_map is not None:
+            for req_id in req_ids:
+                req_state = self.requests.get(req_id)
+                if not (req_state and req_state.sampling_params):
+                    continue
+                if getattr(req_state.sampling_params, "extract_activations", False):
+                    req_ids_needing_activations.add(req_id)
 
         self.collected_activations: dict[int, torch.Tensor] = {}
 

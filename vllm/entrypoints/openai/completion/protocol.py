@@ -175,11 +175,12 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    extract_activation_layers: list[int] | None = Field(
-        default=None,
+    extract_activations: bool = Field(
+        default=False,
         description=(
-            "Layer indices to extract hidden-state activations from. "
-            "If set, the response includes an activations field."
+            "Whether to extract hidden-state activations. "
+            "Layers are configured at startup via --extract-activation-layers. "
+            "If true, the response includes an activations field."
         ),
     )
 
@@ -333,8 +334,8 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
         )
-        if self.extract_activation_layers is not None:
-            sampling_params.extract_activation_layers = self.extract_activation_layers
+        if self.extract_activations:
+            sampling_params.extract_activations = True
         return sampling_params
 
     @model_validator(mode="before")

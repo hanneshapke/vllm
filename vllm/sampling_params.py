@@ -244,9 +244,9 @@ class SamplingParams(
     implementations."""
 
     # Fields for activation extraction
-    extract_activation_layers: list[int] | None = None
-    """Layer indices to extract activations from. If set, activations from
-    the specified layers are captured and returned. None means no extraction."""
+    extract_activations: bool = False
+    """Whether to extract activations for this request. Layers are configured
+    at startup via --extract-activation-layers."""
 
     # Fields used for bad words
     bad_words: list[str] | None = None
