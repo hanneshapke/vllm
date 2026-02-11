@@ -3555,6 +3555,10 @@ class GPUModelRunner(
                     sorted(idx + 1 for idx in all_layer_indices)
                 )
                 self.model.set_aux_hidden_state_layers(activation_layer_indices)
+                # Must disable CUDA graphs for this batch because the model
+                # output shape changes (returns tuple with aux hidden states
+                # instead of a single tensor).
+                cudagraph_mode = CUDAGraphMode.NONE
             else:
                 logger.warning_once(
                     "Model %s does not support set_aux_hidden_state_layers. "
