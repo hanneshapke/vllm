@@ -3568,6 +3568,10 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        # Skip compiled model when extracting activations because the
+        # compiled graph was traced without aux_hidden_state outputs and
+        # cannot handle the changed return type (tuple vs tensor).
+        skip_compiled = has_encoder_input or bool(activation_layer_indices)
         with (
             set_forward_context(
                 attn_metadata,
@@ -3578,7 +3582,7 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                skip_compiled=skip_compiled,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
