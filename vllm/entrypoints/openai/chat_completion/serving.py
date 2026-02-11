@@ -1491,7 +1491,7 @@ class OpenAIServingChat(OpenAIServing):
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
                     activations=_serialize_activations(output.activations)
-                    if request.extract_activations
+                    if request.extract_activation_layers is not None
                     else None,
                 )
                 choices.append(choice_data)
@@ -1703,7 +1703,7 @@ class OpenAIServingChat(OpenAIServing):
                     as_list(output.token_ids) if request.return_token_ids else None
                 ),
                 activations=_serialize_activations(output.activations)
-                if request.extract_activations
+                if request.extract_activation_layers is not None
                 else None,
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)

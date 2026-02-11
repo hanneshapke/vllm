@@ -3527,23 +3527,16 @@ class GPUModelRunner(
             req_state = self.requests.get(req_id)
             if not (req_state and req_state.sampling_params):
                 continue
-            extract_activations = getattr(
-                req_state.sampling_params, "extract_activations", False
+            layers = getattr(
+                req_state.sampling_params, "extract_activation_layers", None
             )
-            if not extract_activations:
+            if layers is None:
                 continue
             needs_activations = True
             req_ids_needing_activations.add(req_id)
-            activation_layers = getattr(
-                req_state.sampling_params, "activation_layers", None
-            )
-            if activation_layers:
-                if all_layer_indices is None:
-                    all_layer_indices = set()
-                all_layer_indices.update(activation_layers)
-            else:
-                all_layer_indices = None
-                break
+            if all_layer_indices is None:
+                all_layer_indices = set()
+            all_layer_indices.update(layers)
 
         if needs_activations and hasattr(self, "compilation_config"):
             from vllm.config.compilation import CompilationMode

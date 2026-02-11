@@ -348,19 +348,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
-    extract_activations: bool = Field(
-        default=False,
-        description="If true, return intermediate layer activations.",
-    )
-    activation_layers: list[int] | None = Field(
+    extract_activation_layers: list[int] | None = Field(
         default=None,
         description=(
-            "Layer indices to extract activations from. None means all layers."
+            "Layer indices to extract hidden-state activations from. "
+            "If set, the response includes an activations field."
         ),
-    )
-    activation_type: str = Field(
-        default="hidden_states",
-        description="Type of activations to extract: 'hidden_states'.",
     )
 
     # --8<-- [end:chat-completion-extra-params]
@@ -498,12 +491,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        if self.extract_activations:
-            extra_args["extract_activations"] = True
-            if self.activation_layers is not None:
-                extra_args["activation_layers"] = self.activation_layers
-            if self.activation_type != "hidden_states":
-                extra_args["activation_type"] = self.activation_type
+        if self.extract_activation_layers is not None:
+            extra_args["extract_activation_layers"] = self.extract_activation_layers
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,

@@ -244,12 +244,9 @@ class SamplingParams(
     implementations."""
 
     # Fields for activation extraction
-    extract_activations: bool = False
-    """Whether to extract intermediate layer activations during inference."""
-    activation_layers: list[int] | None = None
-    """List of layer indices to extract activations from. None = all layers."""
-    activation_type: str = "hidden_states"
-    """Type of activations to extract: 'hidden_states', 'attention', or 'mlp'."""
+    extract_activation_layers: list[int] | None = None
+    """Layer indices to extract activations from. If set, activations from
+    the specified layers are captured and returned. None means no extraction."""
 
     # Fields used for bad words
     bad_words: list[str] | None = None

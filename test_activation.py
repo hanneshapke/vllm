@@ -58,8 +58,7 @@ def main():
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=args.max_tokens,
-        extract_activations=True,
-        activation_layers=args.layers,
+        extract_activation_layers=args.layers,
     )
 
     prompts = ["What is the capital of France?"]

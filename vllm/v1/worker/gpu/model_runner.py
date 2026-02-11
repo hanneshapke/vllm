@@ -177,8 +177,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
 
         # Activation extraction state.
-        # req_id -> (activation_layers or None for all)
-        self._activation_reqs: dict[str, list[int] | None] = {}
+        # req_id -> layer indices to extract
+        self._activation_reqs: dict[str, list[int]] = {}
         self._collected_activations: dict[int, torch.Tensor] = {}
         self._req_ids_needing_activations: set[str] = set()
 
@@ -486,8 +486,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Track activation extraction config.
             sp = new_req_data.sampling_params
-            if sp is not None and getattr(sp, "extract_activations", False):
-                self._activation_reqs[req_id] = getattr(sp, "activation_layers", None)
+            layers = getattr(sp, "extract_activation_layers", None) if sp else None
+            if layers is not None:
+                self._activation_reqs[req_id] = layers
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -893,18 +894,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids_needing_activations: set[str] = set()
         if not dummy_run and input_batch is not None:
             for req_id in input_batch.req_ids:
-                activation_layers = self._activation_reqs.get(req_id)
-                if req_id not in self._activation_reqs:
+                layers = self._activation_reqs.get(req_id)
+                if layers is None:
                     continue
                 needs_activations = True
                 req_ids_needing_activations.add(req_id)
-                if activation_layers:
-                    if all_layer_indices is None:
-                        all_layer_indices = set()
-                    all_layer_indices.update(activation_layers)
-                else:
-                    all_layer_indices = None
-                    break
+                if all_layer_indices is None:
+                    all_layer_indices = set()
+                all_layer_indices.update(layers)
 
         # Set up activation capture hooks (only in eager mode).
         activation_collector = None
