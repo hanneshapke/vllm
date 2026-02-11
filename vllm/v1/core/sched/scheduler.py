@@ -1394,6 +1394,13 @@ class Scheduler(SchedulerInterface):
             request_activations: dict[int, torch.Tensor] | None = None
             if model_runner_output.activations:
                 req_activations = model_runner_output.activations.get(req_id)
+                logger.info(
+                    "Scheduler: req_id=%s, activations in output=%s, "
+                    "req_activations=%s",
+                    req_id,
+                    list(model_runner_output.activations.keys())[:3],
+                    list(req_activations.keys()) if req_activations else None,
+                )
                 if req_activations:
                     request_activations = {
                         layer_idx: act.cpu().contiguous()

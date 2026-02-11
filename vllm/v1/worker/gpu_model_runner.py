@@ -3579,6 +3579,13 @@ class GPUModelRunner(
                             **model_kwargs,
                         )
                     collected_activations = collector.get_activations()
+                    logger.info(
+                        "Activation collection: got %d layers, keys=%s",
+                        len(collected_activations),
+                        list(collected_activations.keys())
+                        if collected_activations
+                        else [],
+                    )
             except Exception as e:
                 logger.error("Error during activation collection: %s", e, exc_info=True)
                 collected_activations = {}
@@ -3865,6 +3872,13 @@ class GPUModelRunner(
         req_ids_needing_activations = getattr(
             self, "req_ids_needing_activations", set()
         )
+        logger.info(
+            "sample_tokens: collected_activations=%d layers, "
+            "req_ids_needing=%d, req_ids_output=%s",
+            len(collected_activations),
+            len(req_ids_needing_activations),
+            req_ids_output_copy[:3] if req_ids_output_copy else [],
+        )
         if collected_activations and req_ids_needing_activations:
             activations_dict = {}
             for req_id in req_ids_output_copy:
@@ -3874,6 +3888,11 @@ class GPUModelRunner(
                     for layer_idx, activation in collected_activations.items():
                         req_activations[layer_idx] = activation.cpu().contiguous()
                     activations_dict[req_id] = req_activations
+            logger.info(
+                "sample_tokens: activations_dict has %d req_ids, keys=%s",
+                len(activations_dict),
+                list(activations_dict.keys())[:3] if activations_dict else [],
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
