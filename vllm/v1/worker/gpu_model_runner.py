@@ -21,7 +21,6 @@ import torch.nn as nn
 from tqdm import tqdm
 
 import vllm.envs as envs
-from vllm.activation_collector import ActivationCollector
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -3538,112 +3537,71 @@ class GPUModelRunner(
                 all_layer_indices = set()
             all_layer_indices.update(layers)
 
-        if needs_activations and hasattr(self, "compilation_config"):
-            from vllm.config.compilation import CompilationMode
-
-            if self.compilation_config.mode != CompilationMode.NONE:
-                logger.warning(
-                    "Activation extraction requested but compilation is enabled "
-                    "(mode=%s). Disabling compilation.",
-                    self.compilation_config.mode,
+        # Set aux_hidden_state_layers for activation extraction if needed.
+        # This uses the same in-model capture mechanism as EAGLE3, which
+        # works with torch.compile (unlike PyTorch forward hooks).
+        self.collected_activations: dict[int, torch.Tensor] = {}
+        activation_layer_indices: tuple[int, ...] = ()
+        if (
+            needs_activations
+            and all_layer_indices
+            and not self.use_aux_hidden_state_outputs
+        ):
+            if hasattr(self.model, "set_aux_hidden_state_layers"):
+                # aux_hidden_state captures hidden_states+residual BEFORE each
+                # listed layer index. Capturing at index i gives the output of
+                # layer i-1. To get post-layer output for layer i, request i+1.
+                activation_layer_indices = tuple(
+                    sorted(idx + 1 for idx in all_layer_indices)
                 )
-                self.compilation_config.mode = CompilationMode.NONE
-
-        # Run the model with activation collection if needed
-        collected_activations: dict[int, torch.Tensor] = {}
-        if needs_activations:
-            try:
-                with ActivationCollector(self.model, all_layer_indices) as collector:
-                    with (
-                        set_forward_context(
-                            attn_metadata,
-                            self.vllm_config,
-                            num_tokens=num_tokens_padded,
-                            num_tokens_across_dp=num_tokens_across_dp,
-                            cudagraph_runtime_mode=cudagraph_mode,
-                            batch_descriptor=batch_desc,
-                            ubatch_slices=ubatch_slices_padded,
-                            slot_mapping=slot_mappings,
-                            skip_compiled=has_encoder_input,
-                        ),
-                        record_function_or_nullcontext("gpu_model_runner: forward"),
-                        self.maybe_get_kv_connector_output(
-                            scheduler_output
-                        ) as kv_connector_output,
-                    ):
-                        model_output = self._model_forward(
-                            input_ids=input_ids,
-                            positions=positions,
-                            intermediate_tensors=intermediate_tensors,
-                            inputs_embeds=inputs_embeds,
-                            **model_kwargs,
-                        )
-                    collected_activations = collector.get_activations()
-                    logger.info(
-                        "Activation collection: got %d layers, keys=%s",
-                        len(collected_activations),
-                        list(collected_activations.keys())
-                        if collected_activations
-                        else [],
-                    )
-            except Exception as e:
-                logger.error("Error during activation collection: %s", e, exc_info=True)
-                collected_activations = {}
-                # Run model normally if activation collection failed
-                with (
-                    set_forward_context(
-                        attn_metadata,
-                        self.vllm_config,
-                        num_tokens=num_tokens_padded,
-                        num_tokens_across_dp=num_tokens_across_dp,
-                        cudagraph_runtime_mode=cudagraph_mode,
-                        batch_descriptor=batch_desc,
-                        ubatch_slices=ubatch_slices_padded,
-                        slot_mapping=slot_mappings,
-                        skip_compiled=has_encoder_input,
-                    ),
-                    record_function_or_nullcontext("gpu_model_runner: forward"),
-                    self.maybe_get_kv_connector_output(
-                        scheduler_output
-                    ) as kv_connector_output,
-                ):
-                    model_output = self._model_forward(
-                        input_ids=input_ids,
-                        positions=positions,
-                        intermediate_tensors=intermediate_tensors,
-                        inputs_embeds=inputs_embeds,
-                        **model_kwargs,
-                    )
-        else:
-            # Run the model.
-            # Use persistent buffers for CUDA graphs.
-            with (
-                set_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    cudagraph_runtime_mode=cudagraph_mode,
-                    batch_descriptor=batch_desc,
-                    ubatch_slices=ubatch_slices_padded,
-                    slot_mapping=slot_mappings,
-                    skip_compiled=has_encoder_input,
-                ),
-                record_function_or_nullcontext("gpu_model_runner: forward"),
-                self.maybe_get_kv_connector_output(
-                    scheduler_output
-                ) as kv_connector_output,
-            ):
-                model_output = self._model_forward(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
+                self.model.set_aux_hidden_state_layers(activation_layer_indices)
+            else:
+                logger.warning_once(
+                    "Model %s does not support set_aux_hidden_state_layers. "
+                    "Activation extraction is not available.",
+                    type(self.model).__name__,
                 )
+
+        # Run the model.
+        # Use persistent buffers for CUDA graphs.
+        with (
+            set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,
+                skip_compiled=has_encoder_input,
+            ),
+            record_function_or_nullcontext("gpu_model_runner: forward"),
+            self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
+        ):
+            model_output = self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
+            if activation_layer_indices:
+                # Activation extraction: unpack aux hidden states and map
+                # back to the originally requested layer indices.
+                hidden_states, collected_aux = model_output
+                sorted_requested = sorted(all_layer_indices)
+                self.collected_activations = {
+                    orig_idx: act.detach()
+                    for orig_idx, act in zip(sorted_requested, collected_aux)
+                }
+                # Reset aux layers so subsequent non-activation requests
+                # don't incur the overhead.
+                self.model.set_aux_hidden_state_layers(())
+                aux_hidden_states = None
+            elif self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
             else:
@@ -3714,8 +3672,8 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
-        # Store collected activations temporarily (will be used in sample_tokens)
-        self.collected_activations = collected_activations
+        # req_ids_needing_activations is used in sample_tokens() to map
+        # collected activations to request IDs.
         self.req_ids_needing_activations = req_ids_needing_activations
         return None
 
@@ -3872,27 +3830,14 @@ class GPUModelRunner(
         req_ids_needing_activations = getattr(
             self, "req_ids_needing_activations", set()
         )
-        logger.info(
-            "sample_tokens: collected_activations=%d layers, "
-            "req_ids_needing=%d, req_ids_output=%s",
-            len(collected_activations),
-            len(req_ids_needing_activations),
-            req_ids_output_copy[:3] if req_ids_output_copy else [],
-        )
         if collected_activations and req_ids_needing_activations:
             activations_dict = {}
             for req_id in req_ids_output_copy:
                 if req_id in req_ids_needing_activations:
                     req_activations: dict[int, torch.Tensor] = {}
-                    # TODO: Slice properly based on request's token range
                     for layer_idx, activation in collected_activations.items():
                         req_activations[layer_idx] = activation.cpu().contiguous()
                     activations_dict[req_id] = req_activations
-            logger.info(
-                "sample_tokens: activations_dict has %d req_ids, keys=%s",
-                len(activations_dict),
-                list(activations_dict.keys())[:3] if activations_dict else [],
-            )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
