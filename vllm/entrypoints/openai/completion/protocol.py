@@ -300,9 +300,7 @@ class CompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        if self.extract_activation_layers is not None:
-            extra_args["extract_activation_layers"] = self.extract_activation_layers
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
@@ -335,6 +333,9 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
         )
+        if self.extract_activation_layers is not None:
+            sampling_params.extract_activation_layers = self.extract_activation_layers
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
@@ -444,6 +445,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
+    activations: dict[str, list[float]] | None = None
 
 
 class CompletionResponse(OpenAIBaseModel):

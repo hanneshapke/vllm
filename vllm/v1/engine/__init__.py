@@ -157,10 +157,7 @@ class EngineCoreOutput(
     num_nans_in_logits: int = 0
 
     # Activations from intermediate layers during inference.
-    # Note: Activations are not serialized through EngineCoreOutput due to
-    # msgspec limitations with nested dicts of tensors. They are passed
-    # through ModelRunnerOutput and CompletionOutput instead.
-    # This field is kept for type hints but should always be None.
+    # Serialized via MsgpackEncoder/Decoder which support torch.Tensor.
     activations: dict[int, torch.Tensor] | None = None
 
     @property
