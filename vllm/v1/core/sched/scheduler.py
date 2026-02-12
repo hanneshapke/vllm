@@ -1391,6 +1391,18 @@ class Scheduler(SchedulerInterface):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            request_activations: dict[int, torch.Tensor] | None = None
+            if model_runner_output.activations:
+                req_activations = model_runner_output.activations.get(req_id)
+                if req_activations:
+                    request_activations = {
+                        layer_idx: act.cpu().contiguous()
+                        if act.device.type != "cpu"
+                        else act
+                        for layer_idx, act in req_activations.items()
+                    }
+                    request.activations = request_activations
+
             if (
                 new_token_ids
                 or pooler_output is not None
@@ -1405,6 +1417,7 @@ class Scheduler(SchedulerInterface):
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                        activations=request_activations,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),

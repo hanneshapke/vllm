@@ -243,6 +243,11 @@ class SamplingParams(
     implementations, plugins, etc. Not used by any in-tree sampling
     implementations."""
 
+    # Fields for activation extraction
+    extract_activations: bool = False
+    """Whether to extract activations for this request. Layers are configured
+    at startup via --extract-activation-layers."""
+
     # Fields used for bad words
     bad_words: list[str] | None = None
     """Words that are not allowed to be generated. More precisely, only the

@@ -3518,8 +3518,25 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        # Check if any request needs activation extraction.
+        # Layers are configured at startup via --extract-activation-layers,
+        # so the model always returns aux_hidden_states when configured.
+        # Here we just track which request IDs want activations.
+        req_ids_needing_activations: set[str] = set()
+        extract_layer_map = getattr(self, "extract_activation_layer_map", None)
+        if extract_layer_map is not None:
+            for req_id in req_ids:
+                req_state = self.requests.get(req_id)
+                if not (req_state and req_state.sampling_params):
+                    continue
+                if getattr(req_state.sampling_params, "extract_activations", False):
+                    req_ids_needing_activations.add(req_id)
+
+        self.collected_activations: dict[int, torch.Tensor] = {}
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        skip_compiled = has_encoder_input
         with (
             set_forward_context(
                 attn_metadata,
@@ -3530,7 +3547,7 @@ class GPUModelRunner(
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
+                skip_compiled=skip_compiled,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -3545,8 +3562,43 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
+                # True when EAGLE 3 or activation extraction is used.
                 hidden_states, aux_hidden_states = model_output
+
+                # Extract activations from aux_hidden_states if configured.
+                # Position map was built at startup to handle both
+                # standalone and EAGLE3-merged aux layer ordering.
+                if (
+                    extract_layer_map is not None
+                    and req_ids_needing_activations
+                    and aux_hidden_states
+                ):
+                    positions = self.extract_activation_positions
+                    for aux_idx, pos in positions.items():
+                        orig_layer = extract_layer_map[aux_idx]
+                        act = aux_hidden_states[pos]
+                        logger.info(
+                            "Activation layer %d (aux_idx=%d, pos=%d): "
+                            "shape=%s, dtype=%s, nan=%d, inf=%d, "
+                            "min=%.4f, max=%.4f, mean=%.4f",
+                            orig_layer,
+                            aux_idx,
+                            pos,
+                            act.shape,
+                            act.dtype,
+                            torch.isnan(act).sum().item(),
+                            torch.isinf(act).sum().item(),
+                            act.min().item()
+                            if not torch.all(torch.isnan(act))
+                            else float("nan"),
+                            act.max().item()
+                            if not torch.all(torch.isnan(act))
+                            else float("nan"),
+                            act.mean().item()
+                            if not torch.all(torch.isnan(act))
+                            else float("nan"),
+                        )
+                        self.collected_activations[orig_layer] = act.detach()
             else:
                 # Common case.
                 hidden_states = model_output
@@ -3615,6 +3667,9 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+        # req_ids_needing_activations is used in sample_tokens() to map
+        # collected activations to request IDs.
+        self.req_ids_needing_activations = req_ids_needing_activations
         return None
 
     @torch.inference_mode
@@ -3764,6 +3819,21 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
 
+        # Map collected activations to request IDs
+        activations_dict: dict[str, dict[int, torch.Tensor]] | None = None
+        collected_activations = getattr(self, "collected_activations", {})
+        req_ids_needing_activations = getattr(
+            self, "req_ids_needing_activations", set()
+        )
+        if collected_activations and req_ids_needing_activations:
+            activations_dict = {}
+            for req_id in req_ids_output_copy:
+                if req_id in req_ids_needing_activations:
+                    req_activations: dict[int, torch.Tensor] = {}
+                    for layer_idx, activation in collected_activations.items():
+                        req_activations[layer_idx] = activation.cpu().contiguous()
+                    activations_dict[req_id] = req_activations
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -3784,6 +3854,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                activations=activations_dict,
             )
 
         if not self.use_async_scheduling:
@@ -4205,6 +4276,64 @@ class GPUModelRunner(
                         aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
+
+                # Set up activation extraction layers from startup config.
+                # This must happen BEFORE torch.compile so the compiled
+                # graph traces the tuple-return path.
+                extract_layers = self.model_config.extract_activation_layers
+                if extract_layers is not None:
+                    if not hasattr(self.model, "set_aux_hidden_state_layers"):
+                        raise RuntimeError(
+                            f"Model {type(self.model).__name__} does not "
+                            "support set_aux_hidden_state_layers. "
+                            "Activation extraction is not available."
+                        )
+                    # aux captures hidden_states+residual BEFORE each
+                    # listed layer index. To get output of layer i,
+                    # request index i+1.
+                    self.extract_activation_aux_indices = tuple(
+                        sorted(idx + 1 for idx in extract_layers)
+                    )
+                    self.extract_activation_layer_map = dict(
+                        zip(self.extract_activation_aux_indices, sorted(extract_layers))
+                    )
+                    # Merge with any existing EAGLE3 aux layers
+                    if self.use_aux_hidden_state_outputs:
+                        existing = set(self.model.get_eagle3_aux_hidden_state_layers())
+                        merged = tuple(
+                            sorted(existing | set(self.extract_activation_aux_indices))
+                        )
+                        self.model.set_aux_hidden_state_layers(merged)
+                        # Build position map: aux_idx -> position in
+                        # merged aux_hidden_states list
+                        self.extract_activation_positions = {
+                            aux_idx: merged.index(aux_idx)
+                            for aux_idx in self.extract_activation_aux_indices
+                        }
+                        logger.info(
+                            "Activation extraction layers %s merged with "
+                            "EAGLE3 aux layers. Combined aux indices: %s",
+                            extract_layers,
+                            merged,
+                        )
+                    else:
+                        self.model.set_aux_hidden_state_layers(
+                            self.extract_activation_aux_indices
+                        )
+                        self.use_aux_hidden_state_outputs = True
+                        # No merge — positions are 0, 1, 2, ...
+                        self.extract_activation_positions = {
+                            aux_idx: i
+                            for i, aux_idx in enumerate(
+                                self.extract_activation_aux_indices
+                            )
+                        }
+                        logger.info(
+                            "Activation extraction enabled for layers %s "
+                            "(aux indices: %s)",
+                            extract_layers,
+                            self.extract_activation_aux_indices,
+                        )
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:

@@ -7,6 +7,7 @@ import time
 from typing import Any, ClassVar, Literal, TypeAlias
 
 import regex as re
+import torch
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -111,6 +112,17 @@ class UsageInfo(OpenAIBaseModel):
 class RequestResponseMetadata(BaseModel):
     request_id: str
     final_usage_info: UsageInfo | None = None
+
+
+def _serialize_activations(
+    activations: dict[int, torch.Tensor] | None,
+) -> dict[str, list[float]] | None:
+    if activations is None:
+        return None
+    return {
+        str(k): torch.nan_to_num(v.flatten(), nan=0.0).tolist()
+        for k, v in activations.items()
+    }
 
 
 class JsonSchemaResponseFormat(OpenAIBaseModel):

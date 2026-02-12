@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.activation_collector import ActivationCollector
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import prepare_communication_buffer_for_model
@@ -174,6 +175,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+
+        # Activation extraction state.
+        # req_ids that want activations
+        self._activation_reqs: set[str] = set()
+        self._collected_activations: dict[int, torch.Tensor] = {}
+        self._req_ids_needing_activations: set[str] = set()
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -432,6 +439,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_runner.remove_request(req_id)
             self.prompt_logprobs_worker.remove_request(req_id)
             self.lora_state.remove_request(req_id)
+            self._activation_reqs.discard(req_id)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.supports_mm_inputs:
@@ -475,6 +483,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_id, req_index, new_req_data.sampling_params
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+
+            # Track activation extraction config.
+            sp = new_req_data.sampling_params
+            if sp and getattr(sp, "extract_activations", False):
+                self._activation_reqs.add(req_id)
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -874,36 +887,62 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.prepare_dummy_attn_metadata(input_batch)
             # FIXME(woosuk): Fix warmup for LoRA.
 
-        # Run model.
-        if use_cudagraph:
-            # Run CUDA graph.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            self.kv_connector.pre_forward(scheduler_output)
-            hidden_states = self.cudagraph_manager.run(
-                input_batch.num_tokens_after_padding
-            )
-        else:
-            # Run PyTorch model in eager mode.
-            positions = input_batch.positions
-            if self.uses_mrope:
-                assert input_batch.mrope_positions is not None
-                positions = input_batch.mrope_positions
-            with set_forward_context(
-                input_batch.attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                # TODO(woosuk): Support piecewise CUDA graph.
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                num_tokens_across_dp=num_tokens_across_dp,
-                slot_mapping=input_batch.slot_mappings,
-            ):
-                self.kv_connector.pre_forward(scheduler_output)
-                hidden_states = self.model(
-                    input_ids=input_batch.input_ids,
-                    positions=positions,
-                    inputs_embeds=input_batch.inputs_embeds,
+        # Check if any request needs activation extraction.
+        needs_activations = False
+        req_ids_needing_activations: set[str] = set()
+        if not dummy_run and input_batch is not None:
+            for req_id in input_batch.req_ids:
+                if req_id in self._activation_reqs:
+                    needs_activations = True
+                    req_ids_needing_activations.add(req_id)
+
+        # Set up activation capture hooks (only in eager mode).
+        activation_collector = None
+        if needs_activations and not use_cudagraph:
+            configured_layers = self.model_config.extract_activation_layers
+            if configured_layers:
+                activation_collector = ActivationCollector(
+                    self.model, set(configured_layers)
                 )
+                activation_collector.register_hooks()
+
+        # Run model.
+        try:
+            if use_cudagraph:
+                # Run CUDA graph.
+                self.kv_connector.pre_forward(scheduler_output)
+                hidden_states = self.cudagraph_manager.run(
+                    input_batch.num_tokens_after_padding
+                )
+            else:
+                # Run PyTorch model in eager mode.
+                positions = input_batch.positions
+                if self.uses_mrope:
+                    assert input_batch.mrope_positions is not None
+                    positions = input_batch.mrope_positions
+                with set_forward_context(
+                    input_batch.attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    # TODO(woosuk): Support piecewise CUDA graph.
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    slot_mapping=input_batch.slot_mappings,
+                ):
+                    self.kv_connector.pre_forward(scheduler_output)
+                    hidden_states = self.model(
+                        input_ids=input_batch.input_ids,
+                        positions=positions,
+                        inputs_embeds=input_batch.inputs_embeds,
+                    )
+        finally:
+            if activation_collector is not None:
+                self._collected_activations = activation_collector.get_activations()
+                self._req_ids_needing_activations = req_ids_needing_activations
+                activation_collector.remove_hooks()
+            else:
+                self._collected_activations = {}
+                self._req_ids_needing_activations = set()
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
         self.execute_model_state = hidden_states, input_batch, kv_connector_output
@@ -931,6 +970,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_prefill_tokens,
         )
 
+        # Map collected activations to request IDs.
+        activations_dict: dict[str, dict[int, torch.Tensor]] | None = None
+        collected_activations = self._collected_activations
+        req_ids_needing_activations = self._req_ids_needing_activations
+        if collected_activations and req_ids_needing_activations:
+            activations_dict = {}
+            query_start_loc = input_batch.query_start_loc
+            for req_idx, req_id in enumerate(input_batch.req_ids):
+                if req_id in req_ids_needing_activations:
+                    req_activations: dict[int, torch.Tensor] = {}
+                    start_idx = query_start_loc[req_idx].item()
+                    end_idx = query_start_loc[req_idx + 1].item()
+                    for layer_idx, activation in collected_activations.items():
+                        req_activation = (
+                            activation[start_idx:end_idx].cpu().contiguous()
+                        )
+                        req_activations[layer_idx] = req_activation
+                    activations_dict[req_id] = req_activations
+
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
             req_ids=input_batch.req_ids,
@@ -940,6 +998,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             kv_connector_output=kv_connector_output,
+            activations=activations_dict,
         )
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,

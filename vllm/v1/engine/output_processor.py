@@ -10,6 +10,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -37,6 +38,8 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+logger = init_logger(__name__)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -177,6 +180,8 @@ class RequestState:
 
         # Stream Interval
         self.stream_interval = stream_interval
+        # Activations from intermediate layers
+        self.activations: dict[int, torch.Tensor] | None = None
         self.sent_tokens_offset = 0  # Offset of sent tokens
 
         # Streaming input queue
@@ -396,7 +401,7 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
-        return CompletionOutput(
+        completion_output = CompletionOutput(
             index=self.request_index,
             text=text,
             token_ids=token_ids,
@@ -405,7 +410,9 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            activations=self.activations,
         )
+        return completion_output
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
         return PoolingOutput(data=pooling_output)
@@ -629,6 +636,7 @@ class OutputProcessor:
             routed_experts = engine_core_output.routed_experts
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
+            req_state.activations = engine_core_output.activations
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
