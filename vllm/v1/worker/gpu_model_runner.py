@@ -3534,6 +3534,17 @@ class GPUModelRunner(
 
         self.collected_activations: dict[int, torch.Tensor] = {}
 
+        # Build per-request token ranges for activation slicing.
+        # Tokens in the batch are ordered by req_ids, so we compute
+        # cumulative offsets from num_scheduled_tokens.
+        if extract_layer_map is not None and req_ids_needing_activations:
+            offset = 0
+            self.activation_token_ranges: dict[str, tuple[int, int]] = {}
+            for i, rid in enumerate(req_ids):
+                n = int(num_scheduled_tokens_np[i])
+                self.activation_token_ranges[rid] = (offset, n)
+                offset += n
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         skip_compiled = has_encoder_input
@@ -3577,7 +3588,7 @@ class GPUModelRunner(
                     for aux_idx, pos in positions.items():
                         orig_layer = extract_layer_map[aux_idx]
                         act = aux_hidden_states[pos]
-                        logger.info(
+                        logger.debug(
                             "Activation layer %d (aux_idx=%d, pos=%d): "
                             "shape=%s, dtype=%s, nan=%d, inf=%d, "
                             "min=%.4f, max=%.4f, mean=%.4f",
@@ -3826,12 +3837,19 @@ class GPUModelRunner(
             self, "req_ids_needing_activations", set()
         )
         if collected_activations and req_ids_needing_activations:
+            token_ranges = getattr(self, "activation_token_ranges", {})
             activations_dict = {}
             for req_id in req_ids_output_copy:
                 if req_id in req_ids_needing_activations:
                     req_activations: dict[int, torch.Tensor] = {}
+                    tok_range = token_ranges.get(req_id)
                     for layer_idx, activation in collected_activations.items():
-                        req_activations[layer_idx] = activation.cpu().contiguous()
+                        if tok_range is not None:
+                            offset, count = tok_range
+                            act = activation[offset:offset + count]
+                        else:
+                            act = activation
+                        req_activations[layer_idx] = act.cpu().contiguous()
                     activations_dict[req_id] = req_activations
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
