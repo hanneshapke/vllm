@@ -1,44 +1,74 @@
 # Activation Extraction Test Plan — Gemma3 & Qwen3
 
+## What Changed
+
+This branch adds Gemma3 support for the activation extraction feature:
+
+1. **`vllm/model_executor/models/gemma3.py`** — `Gemma3ForCausalLM` now implements `SupportsEagle3`, adding `get_eagle3_aux_hidden_state_layers()` which enables the `aux_hidden_state` mechanism needed for activation extraction.
+2. **`vllm/model_executor/models/gemma3_mm.py`** — `Gemma3ForConditionalGeneration` (multimodal) delegates `set_aux_hidden_state_layers` / `get_eagle3_aux_hidden_state_layers` to its inner language model.
+3. **`vllm/v1/worker/gpu_model_runner.py`** — Refactored activation extraction to:
+   - Configure layers once at startup (merged with EAGLE3 aux layers if present)
+   - Use per-request `extract_activations: bool` instead of per-request layer lists
+   - Compute per-request token offset/count ranges for correct batch slicing
+
+### API Contract
+
+- **Startup** (engine-level): `--extract-activation-layers 5 10` or `extract_activation_layers=[5, 10]` in `LLM()`
+- **Per-request** (sampling): `SamplingParams(extract_activations=True)` — boolean opt-in
+- **Response**: `CompletionOutput.activations: dict[int, torch.Tensor] | None`
+- **OpenAI JSON**: `choices[].activations: {"5": [float, ...], "10": [float, ...]} | null`
+
+---
+
 ## Prerequisites
 
 | Requirement | Detail |
 |---|---|
-| **GPU** | NVIDIA GPU with sufficient VRAM (8 GB+ for small models) |
-| **Compilation** | Must be disabled — use `enforce_eager=True` or `CompilationConfig(mode=CompilationMode.NONE)` |
-| **Models** | `google/gemma-3-270m-it` (Gemma3, 18 layers), a Qwen3 variant e.g. `Qwen/Qwen3-0.6B` (28 layers) |
-| **Access** | HuggingFace token set if gated models are used |
+| **GPU** | NVIDIA GPU with sufficient VRAM (≥4 GB for 270m, ≥8 GB for 0.6B) |
+| **Eager mode** | `enforce_eager=True` or `CompilationConfig(mode=CompilationMode.NONE)` — aux_hidden_state hooks work without CUDA graphs |
+| **Models** | `google/gemma-3-270m-it` (Gemma3, 18 layers, hidden_size=1536), `Qwen/Qwen3-0.6B` (28 layers, hidden_size=1024) |
+| **Access** | HuggingFace token set (`HF_TOKEN` env var) if gated models require it |
 
 ---
 
-## Phase 1 — Smoke Tests (Python API)
+## Phase 1 — Smoke Tests (Offline Python API)
 
-These use the offline `LLM` class directly. Run each with `enforce_eager=True`.
+All tests use the offline `LLM` class. Run from the repo root.
 
-### 1.1 Baseline: generation without activations
+### 1.1 Baseline generation (no activations)
 
-Verify normal generation still works for both models.
+Verify normal generation without any activation config.
 
 ```bash
-# Gemma3
+# Gemma3 baseline
 python -c "
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
+
 llm = LLM(model='google/gemma-3-270m-it', max_model_len=512, enforce_eager=True)
-out = llm.generate(['Hello'], SamplingParams(max_tokens=10))
-assert out[0].outputs[0].text, 'No output generated'
-assert out[0].outputs[0].activations is None
+out = llm.generate(['Hello, how are you?'], SamplingParams(max_tokens=10))
+text = out[0].outputs[0].text
+act  = out[0].outputs[0].activations
+assert text, 'No output generated'
+assert act is None, f'Expected None activations, got {type(act)}'
+print(f'Generated: {text}')
 print('PASS: Gemma3 baseline')
 "
+```
 
-# Qwen3
+```bash
+# Qwen3 baseline
 python -c "
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
+
 llm = LLM(model='Qwen/Qwen3-0.6B', max_model_len=512, enforce_eager=True)
-out = llm.generate(['Hello'], SamplingParams(max_tokens=10))
-assert out[0].outputs[0].text, 'No output generated'
-assert out[0].outputs[0].activations is None
+out = llm.generate(['Hello, how are you?'], SamplingParams(max_tokens=10))
+text = out[0].outputs[0].text
+act  = out[0].outputs[0].activations
+assert text, 'No output generated'
+assert act is None, f'Expected None activations, got {type(act)}'
+print(f'Generated: {text}')
 print('PASS: Qwen3 baseline')
 "
 ```
@@ -50,146 +80,322 @@ print('PASS: Qwen3 baseline')
 ### 1.2 Single-layer activation extraction
 
 ```bash
-python test_activation.py --model google/gemma-3-270m-it --layers 5 --max-tokens 10
-python test_activation.py --model Qwen/Qwen3-0.6B         --layers 5 --max-tokens 10
+# Gemma3 — extract layer 5
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
+out = llm.generate(['What is the capital of France?'], sp)
+act = out[0].outputs[0].activations
+
+assert act is not None, 'No activations returned'
+assert set(act.keys()) == {5}, f'Expected key {{5}}, got {set(act.keys())}'
+tensor = act[5]
+print(f'Shape: {tensor.shape}, dtype: {tensor.dtype}')
+print(f'Mean: {tensor.float().mean():.4f}, Std: {tensor.float().std():.4f}')
+assert tensor.shape[1] == 1536, f'Expected hidden_size=1536, got {tensor.shape[1]}'
+assert torch.isfinite(tensor).all(), 'Tensor contains NaN or Inf'
+assert tensor.abs().sum() > 0, 'Tensor is all zeros'
+print('PASS: Gemma3 single-layer extraction')
+"
+```
+
+```bash
+# Qwen3 — extract layer 5
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='Qwen/Qwen3-0.6B',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
+out = llm.generate(['What is the capital of France?'], sp)
+act = out[0].outputs[0].activations
+
+assert act is not None, 'No activations returned'
+assert set(act.keys()) == {5}, f'Expected key {{5}}, got {set(act.keys())}'
+tensor = act[5]
+print(f'Shape: {tensor.shape}, dtype: {tensor.dtype}')
+print(f'Mean: {tensor.float().mean():.4f}, Std: {tensor.float().std():.4f}')
+assert tensor.shape[1] == 1024, f'Expected hidden_size=1024, got {tensor.shape[1]}'
+assert torch.isfinite(tensor).all(), 'Tensor contains NaN or Inf'
+assert tensor.abs().sum() > 0, 'Tensor is all zeros'
+print('PASS: Qwen3 single-layer extraction')
+"
 ```
 
 **Check**:
-- `activations` dict is non-empty
-- Exactly one key: `5`
-- Tensor shape is `[num_generated_tokens, hidden_size]` — the first dim should equal `max_tokens` (10) and the second dim should match the model's hidden size
-- Values are finite (no NaN/Inf): `torch.isfinite(tensor).all()`
+- `activations` dict has exactly one key: `5`
+- Tensor shape: `[num_tokens, hidden_size]` where hidden_size is 1536 (Gemma3) / 1024 (Qwen3)
+- No NaN/Inf, not all zeros
 
 ---
 
 ### 1.3 Multi-layer activation extraction
 
 ```bash
-# Gemma3 has 18 layers (valid indices: 0–17)
-python test_activation.py --model google/gemma-3-270m-it --layers 0 5 10 17 --max-tokens 10
+# Gemma3 — 18 layers, valid indices 0–17
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
 
-# Qwen3-0.6B has 28 layers (valid indices: 0–27)
-python test_activation.py --model Qwen/Qwen3-0.6B         --layers 0 5 14 27 --max-tokens 10
+LAYERS = [0, 5, 10, 17]
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=LAYERS,
+)
+sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
+out = llm.generate(['What is the capital of France?'], sp)
+act = out[0].outputs[0].activations
+
+assert act is not None, 'No activations returned'
+assert set(act.keys()) == set(LAYERS), f'Expected {set(LAYERS)}, got {set(act.keys())}'
+shapes = {k: v.shape for k, v in act.items()}
+print(f'Layer shapes: {shapes}')
+
+# All should have same hidden_size and same num_tokens
+hidden_sizes = set(v.shape[1] for v in act.values())
+num_tokens   = set(v.shape[0] for v in act.values())
+assert len(hidden_sizes) == 1, f'Inconsistent hidden sizes: {hidden_sizes}'
+assert len(num_tokens) == 1, f'Inconsistent token counts: {num_tokens}'
+
+# First vs last layer should differ
+assert not torch.allclose(act[0].float(), act[17].float()), 'Layer 0 and 17 are identical'
+for k, v in act.items():
+    assert torch.isfinite(v).all(), f'Layer {k} has NaN/Inf'
+    assert v.abs().sum() > 0, f'Layer {k} is all zeros'
+print('PASS: Gemma3 multi-layer extraction')
+"
 ```
 
-**Check**:
-- `activations` dict has 4 keys: `{0, 5, 10, 17}` / `{0, 5, 14, 27}`
-- All tensors have the same `hidden_size` dimension
-- All tensors have the same `num_tokens` dimension (= `max_tokens`)
-- First-layer and last-layer activations should have different values (not identical copies)
+```bash
+# Qwen3 — 28 layers, valid indices 0–27
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+LAYERS = [0, 5, 14, 27]
+llm = LLM(
+    model='Qwen/Qwen3-0.6B',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=LAYERS,
+)
+sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
+out = llm.generate(['What is the capital of France?'], sp)
+act = out[0].outputs[0].activations
+
+assert act is not None, 'No activations returned'
+assert set(act.keys()) == set(LAYERS), f'Expected {set(LAYERS)}, got {set(act.keys())}'
+shapes = {k: v.shape for k, v in act.items()}
+print(f'Layer shapes: {shapes}')
+
+hidden_sizes = set(v.shape[1] for v in act.values())
+num_tokens   = set(v.shape[0] for v in act.values())
+assert len(hidden_sizes) == 1, f'Inconsistent hidden sizes: {hidden_sizes}'
+assert len(num_tokens) == 1, f'Inconsistent token counts: {num_tokens}'
+assert not torch.allclose(act[0].float(), act[27].float()), 'Layer 0 and 27 are identical'
+for k, v in act.items():
+    assert torch.isfinite(v).all(), f'Layer {k} has NaN/Inf'
+print('PASS: Qwen3 multi-layer extraction')
+"
+```
 
 ---
 
-### 1.4 Activation opt-in per request
+### 1.4 Per-request opt-in / opt-out
 
-Verify that `extract_activations=False` suppresses extraction even when `--extract-activation-layers` is configured at startup.
+Layers are configured at startup; per-request boolean controls whether activations are returned.
 
-```python
+```bash
+# Gemma3
+python -c "
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
-from vllm.config.compilation import CompilationConfig, CompilationMode
 
 llm = LLM(
-    model="google/gemma-3-270m-it",
+    model='google/gemma-3-270m-it',
     max_model_len=512,
-    compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+    enforce_eager=True,
     extract_activation_layers=[5],
 )
 
 # Request WITH activations
 sp_on = SamplingParams(max_tokens=5, extract_activations=True)
-out_on = llm.generate(["Hello"], sp_on)
+out_on = llm.generate(['Hello'], sp_on)
 
 # Request WITHOUT activations
 sp_off = SamplingParams(max_tokens=5, extract_activations=False)
-out_off = llm.generate(["Hello"], sp_off)
+out_off = llm.generate(['Hello'], sp_off)
 
-assert out_on[0].outputs[0].activations is not None, "Should have activations"
-assert out_off[0].outputs[0].activations is None,    "Should NOT have activations"
-print("PASS: per-request opt-in/out")
+assert out_on[0].outputs[0].activations is not None, 'Should have activations'
+assert out_off[0].outputs[0].activations is None,    'Should NOT have activations'
+print('PASS: Gemma3 per-request opt-in/out')
+"
 ```
 
-Repeat the same test with the Qwen3 model.
+```bash
+# Qwen3
+python -c "
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='Qwen/Qwen3-0.6B',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp_on  = SamplingParams(max_tokens=5, extract_activations=True)
+sp_off = SamplingParams(max_tokens=5, extract_activations=False)
+out_on  = llm.generate(['Hello'], sp_on)
+out_off = llm.generate(['Hello'], sp_off)
+assert out_on[0].outputs[0].activations is not None, 'Should have activations'
+assert out_off[0].outputs[0].activations is None,    'Should NOT have activations'
+print('PASS: Qwen3 per-request opt-in/out')
+"
+```
 
 ---
 
-### 1.5 Batch with mixed activation requests
+### 1.5 Mixed-batch activation slicing
 
-Verify per-request slicing in a batch where only some requests ask for activations.
+Multiple prompts in one batch, only some requesting activations. Verifies per-request token slicing.
 
-```python
+```bash
+# Gemma3
+python -c "
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
-from vllm.config.compilation import CompilationConfig, CompilationMode
 
 llm = LLM(
-    model="google/gemma-3-270m-it",
+    model='google/gemma-3-270m-it',
     max_model_len=512,
-    compilation_config=CompilationConfig(mode=CompilationMode.NONE),
+    enforce_eager=True,
     extract_activation_layers=[5],
 )
 
 sp_on  = SamplingParams(max_tokens=8, extract_activations=True)
 sp_off = SamplingParams(max_tokens=8, extract_activations=False)
 
-# Three prompts: only first and third request activations
 outputs = llm.generate(
-    ["Prompt A", "Prompt B", "Prompt C"],
+    ['Prompt A about cats', 'Prompt B about dogs', 'Prompt C about birds'],
     [sp_on, sp_off, sp_on],
 )
 
-assert outputs[0].outputs[0].activations is not None, "Request 0 should have activations"
-assert outputs[1].outputs[0].activations is None,     "Request 1 should NOT have activations"
-assert outputs[2].outputs[0].activations is not None,  "Request 2 should have activations"
+assert outputs[0].outputs[0].activations is not None, 'Request 0 should have activations'
+assert outputs[1].outputs[0].activations is None,     'Request 1 should NOT have activations'
+assert outputs[2].outputs[0].activations is not None, 'Request 2 should have activations'
 
-# Each request's activation should be sliced to its OWN tokens, not the full batch
 act_0 = outputs[0].outputs[0].activations[5]
 act_2 = outputs[2].outputs[0].activations[5]
-assert act_0.shape[0] == 8, f"Expected 8 tokens, got {act_0.shape[0]}"
-assert act_2.shape[0] == 8, f"Expected 8 tokens, got {act_2.shape[0]}"
-print("PASS: mixed-batch slicing")
+print(f'Request 0 activation shape: {act_0.shape}')
+print(f'Request 2 activation shape: {act_2.shape}')
+
+# Token count should be <= max_tokens (could be less if EOS hit early)
+assert act_0.shape[0] <= 8, f'Request 0: expected <=8 tokens, got {act_0.shape[0]}'
+assert act_2.shape[0] <= 8, f'Request 2: expected <=8 tokens, got {act_2.shape[0]}'
+assert act_0.shape[1] == 1536, f'Wrong hidden size: {act_0.shape[1]}'
+print('PASS: Gemma3 mixed-batch slicing')
+"
 ```
 
-Repeat with Qwen3.
+```bash
+# Qwen3
+python -c "
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='Qwen/Qwen3-0.6B',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+
+sp_on  = SamplingParams(max_tokens=8, extract_activations=True)
+sp_off = SamplingParams(max_tokens=8, extract_activations=False)
+
+outputs = llm.generate(
+    ['Prompt A about cats', 'Prompt B about dogs', 'Prompt C about birds'],
+    [sp_on, sp_off, sp_on],
+)
+
+assert outputs[0].outputs[0].activations is not None, 'Request 0 should have activations'
+assert outputs[1].outputs[0].activations is None,     'Request 1 should NOT have activations'
+assert outputs[2].outputs[0].activations is not None, 'Request 2 should have activations'
+act_0 = outputs[0].outputs[0].activations[5]
+print(f'Request 0 activation shape: {act_0.shape}')
+assert act_0.shape[1] == 1024, f'Wrong hidden size: {act_0.shape[1]}'
+print('PASS: Qwen3 mixed-batch slicing')
+"
+```
 
 ---
 
 ### 1.6 Out-of-range layer index
 
-Request a layer index beyond the model's layer count.
-
-```python
+```bash
 # Gemma3 has 18 layers — index 20 is out of range
-sp = SamplingParams(max_tokens=5, extract_activation_layers=[20])
+python -c "
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+try:
+    llm = LLM(
+        model='google/gemma-3-270m-it',
+        max_model_len=512,
+        enforce_eager=True,
+        extract_activation_layers=[20],
+    )
+    sp = SamplingParams(max_tokens=5, extract_activations=True)
+    out = llm.generate(['Hello'], sp)
+    act = out[0].outputs[0].activations
+    if act and 20 in act:
+        print('OBSERVATION: Out-of-range layer 20 returned activations (unexpected)')
+    elif act is None or 20 not in act:
+        print('OBSERVATION: Out-of-range layer 20 was silently ignored')
+except Exception as e:
+    print(f'OBSERVATION: Error raised for out-of-range layer: {type(e).__name__}: {e}')
+"
 ```
 
-**Expected**: Either a clear error at startup/request time, or the layer is silently ignored. Document whichever behavior you observe.
+**Expected**: Either a clear error or silent skip. Document the behavior.
 
 ---
 
 ## Phase 2 — OpenAI-Compatible Server Tests
 
-Start the server, then call it with `curl` or the `openai` Python client.
-
-### 2.1 Start the server
+### 2.1 Start the Gemma3 server
 
 ```bash
-# Gemma3
 python -m vllm.entrypoints.openai.api_server \
     --model google/gemma-3-270m-it \
     --max-model-len 512 \
     --enforce-eager \
     --extract-activation-layers 5 10
-
-# Qwen3
-python -m vllm.entrypoints.openai.api_server \
-    --model Qwen/Qwen3-0.6B \
-    --max-model-len 512 \
-    --enforce-eager \
-    --extract-activation-layers 5 10
 ```
 
-### 2.2 Chat completion with activations
+Wait for `"Uvicorn running on http://0.0.0.0:8000"`, then in a separate terminal:
+
+### 2.2 Chat completion WITH activations
 
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
@@ -199,17 +405,21 @@ curl -s http://localhost:8000/v1/chat/completions \
     "messages": [{"role": "user", "content": "What is 2+2?"}],
     "max_tokens": 10,
     "extract_activations": true
-  }' | python -m json.tool
+  }' | python3 -c "
+import json, sys
+resp = json.load(sys.stdin)
+act = resp['choices'][0].get('activations')
+assert act is not None, 'No activations in response'
+assert '5' in act and '10' in act, f'Expected keys 5,10, got {list(act.keys())}'
+print(f'Layer 5: {len(act[\"5\"])} floats')
+print(f'Layer 10: {len(act[\"10\"])} floats')
+assert not any(v != v for v in act['5']), 'NaN in layer 5'   # NaN != NaN
+assert not any(v != v for v in act['10']), 'NaN in layer 10'
+print('PASS: chat completion with activations')
+"
 ```
 
-**Check**:
-- Response has `choices[0].activations`
-- Keys are `"5"` and `"10"` (string-typed layer indices)
-- Each value is a flat list of floats
-- List length = `num_generated_tokens * hidden_size`
-- No NaN values in the list
-
-### 2.3 Chat completion without activations (default)
+### 2.3 Chat completion WITHOUT activations (default)
 
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
@@ -218,12 +428,16 @@ curl -s http://localhost:8000/v1/chat/completions \
     "model": "google/gemma-3-270m-it",
     "messages": [{"role": "user", "content": "What is 2+2?"}],
     "max_tokens": 10
-  }' | python -m json.tool
+  }' | python3 -c "
+import json, sys
+resp = json.load(sys.stdin)
+act = resp['choices'][0].get('activations')
+assert act is None, f'Expected no activations, got {type(act)}'
+print('PASS: chat completion without activations')
+"
 ```
 
-**Check**: `activations` field is absent or `null`.
-
-### 2.4 Text completion with activations
+### 2.4 Text completion WITH activations
 
 ```bash
 curl -s http://localhost:8000/v1/completions \
@@ -233,14 +447,31 @@ curl -s http://localhost:8000/v1/completions \
     "prompt": "The capital of France is",
     "max_tokens": 10,
     "extract_activations": true
-  }' | python -m json.tool
+  }' | python3 -c "
+import json, sys
+resp = json.load(sys.stdin)
+act = resp['choices'][0].get('activations')
+assert act is not None, 'No activations in response'
+assert '5' in act and '10' in act, f'Expected keys 5,10, got {list(act.keys())}'
+print(f'Layer 5: {len(act[\"5\"])} floats')
+print(f'Layer 10: {len(act[\"10\"])} floats')
+print('PASS: text completion with activations')
+"
 ```
 
-**Check**: Same as 2.2 — `activations` present in `choices[0]`.
+### 2.5 Repeat with Qwen3
 
-### 2.5 Repeat 2.2–2.4 with Qwen3
+Stop the Gemma3 server, then:
 
-Swap model to `Qwen/Qwen3-0.6B` and repeat. Hidden size will differ; verify the list lengths are consistent with Qwen3's hidden dimension.
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model Qwen/Qwen3-0.6B \
+    --max-model-len 512 \
+    --enforce-eager \
+    --extract-activation-layers 5 10
+```
+
+Then repeat 2.2–2.4 with `"model": "Qwen/Qwen3-0.6B"`.
 
 ---
 
@@ -248,90 +479,332 @@ Swap model to `Qwen/Qwen3-0.6B` and repeat. Hidden size will differ; verify the 
 
 ### 3.1 Determinism
 
-Run the same prompt twice with `temperature=0` and activation extraction on.
+```bash
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
 
-**Check**: Activation tensors are bitwise identical across both runs (same model, same input → same hidden states).
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
 
-### 3.2 Activation values are not all zeros
+out1 = llm.generate(['What is 2+2?'], sp)
+out2 = llm.generate(['What is 2+2?'], sp)
 
-```python
-for layer_idx, tensor in activations.items():
-    assert tensor.abs().sum() > 0, f"Layer {layer_idx} activations are all zeros"
+act1 = out1[0].outputs[0].activations[5]
+act2 = out2[0].outputs[0].activations[5]
+assert torch.equal(act1, act2), 'Activations differ across identical runs'
+print(f'Activation shape: {act1.shape}')
+print('PASS: Gemma3 determinism')
+"
+```
+
+### 3.2 Non-zero activations
+
+```bash
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[0, 5, 17],
+)
+sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
+out = llm.generate(['Hello world'], sp)
+act = out[0].outputs[0].activations
+
+for layer_idx, tensor in act.items():
+    assert tensor.abs().sum() > 0, f'Layer {layer_idx} activations are all zeros'
+    print(f'Layer {layer_idx}: abs_sum={tensor.abs().sum():.2f}, shape={tensor.shape}')
+print('PASS: non-zero activations')
+"
 ```
 
 ### 3.3 Different prompts produce different activations
 
-Generate activations for two semantically distinct prompts (e.g., "Hello" vs "Explain quantum physics"). Verify the tensors differ.
+```bash
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
 
-### 3.4 Generation quality unchanged
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
 
-Compare output text with and without `--extract-activation-layers`. The generated text for a deterministic config (`temperature=0`) should be identical — activation hooks must not alter the forward pass.
+out_a = llm.generate(['Hello'], sp)
+out_b = llm.generate(['Explain quantum physics in detail'], sp)
 
-```python
+act_a = out_a[0].outputs[0].activations[5]
+act_b = out_b[0].outputs[0].activations[5]
+
+# Shapes may differ (different prompt lengths), but values should not be identical
+if act_a.shape == act_b.shape:
+    assert not torch.allclose(act_a.float(), act_b.float(), atol=1e-6), \
+        'Different prompts produced identical activations'
+print(f'Prompt A activation shape: {act_a.shape}')
+print(f'Prompt B activation shape: {act_b.shape}')
+print('PASS: different prompts produce different activations')
+"
+```
+
+### 3.4 Generation quality unchanged by activation extraction
+
+```bash
+python -c "
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
 # Without extraction
-llm_plain = LLM(model="google/gemma-3-270m-it", max_model_len=512, enforce_eager=True)
-out_plain = llm_plain.generate(["What is AI?"], SamplingParams(temperature=0, max_tokens=20))
+llm_plain = LLM(model='google/gemma-3-270m-it', max_model_len=512, enforce_eager=True)
+out_plain = llm_plain.generate(
+    ['What is AI?'], SamplingParams(temperature=0, max_tokens=20)
+)
+text_plain = out_plain[0].outputs[0].text
+del llm_plain  # free GPU memory
 
 # With extraction
 llm_act = LLM(
-    model="google/gemma-3-270m-it", max_model_len=512, enforce_eager=True,
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
     extract_activation_layers=[5],
 )
 sp_act = SamplingParams(temperature=0, max_tokens=20, extract_activations=True)
-out_act = llm_act.generate(["What is AI?"], sp_act)
+out_act = llm_act.generate(['What is AI?'], sp_act)
+text_act = out_act[0].outputs[0].text
 
-assert out_plain[0].outputs[0].text == out_act[0].outputs[0].text, \
-    "Activation extraction should NOT change generation output"
+print(f'Without extraction: {text_plain!r}')
+print(f'With extraction:    {text_act!r}')
+assert text_plain == text_act, 'Activation extraction changed generation output!'
+print('PASS: generation quality unchanged')
+"
 ```
-
-Repeat with Qwen3.
 
 ---
 
 ## Phase 4 — Edge Cases
 
-| # | Test | Expected |
-|---|------|----------|
-| 4.1 | `max_tokens=1` — single token generation | Activation shape `[1, hidden_size]` |
-| 4.2 | Long generation (`max_tokens=256`) | Activation shape `[256, hidden_size]`, no OOM for small models |
-| 4.3 | Layer 0 (first layer) | Valid activations returned |
-| 4.4 | Last layer (index `num_layers - 1`) | Valid activations returned |
-| 4.5 | All layers (every index `0..num_layers-1`) | All returned — check memory impact |
-| 4.6 | Empty prompt (`""`) | Either generates normally or returns an error — should not crash |
-| 4.7 | `enforce_eager=False` without `CompilationMode.NONE` | Should warn or error that hooks won't work with `torch.compile` |
+### 4.1 Single token generation
+
+```bash
+python -c "
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp = SamplingParams(temperature=0, max_tokens=1, extract_activations=True)
+out = llm.generate(['Hello'], sp)
+act = out[0].outputs[0].activations
+assert act is not None, 'No activations'
+tensor = act[5]
+print(f'Shape: {tensor.shape}')
+# First dim should be 1 (single token) or could be prompt+1
+print('PASS: single token generation')
+"
+```
+
+### 4.2 Long generation
+
+```bash
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp = SamplingParams(temperature=0, max_tokens=256, extract_activations=True)
+out = llm.generate(['Tell me a long story'], sp)
+act = out[0].outputs[0].activations
+assert act is not None, 'No activations'
+tensor = act[5]
+print(f'Shape: {tensor.shape}')
+assert torch.isfinite(tensor).all(), 'Contains NaN/Inf'
+print('PASS: long generation (256 tokens)')
+"
+```
+
+### 4.3 First layer (layer 0)
+
+```bash
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[0],
+)
+sp = SamplingParams(temperature=0, max_tokens=5, extract_activations=True)
+out = llm.generate(['Hello'], sp)
+act = out[0].outputs[0].activations
+assert act is not None and 0 in act, 'Layer 0 not in activations'
+assert torch.isfinite(act[0]).all(), 'Layer 0 has NaN/Inf'
+print(f'Layer 0 shape: {act[0].shape}')
+print('PASS: first layer extraction')
+"
+```
+
+### 4.4 Last layer (layer 17 for Gemma3)
+
+```bash
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[17],
+)
+sp = SamplingParams(temperature=0, max_tokens=5, extract_activations=True)
+out = llm.generate(['Hello'], sp)
+act = out[0].outputs[0].activations
+assert act is not None and 17 in act, 'Layer 17 not in activations'
+assert torch.isfinite(act[17]).all(), 'Layer 17 has NaN/Inf'
+print(f'Layer 17 shape: {act[17].shape}')
+print('PASS: last layer extraction')
+"
+```
+
+### 4.5 All layers (0..17 for Gemma3)
+
+```bash
+python -c "
+import torch
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+ALL_LAYERS = list(range(18))
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=ALL_LAYERS,
+)
+sp = SamplingParams(temperature=0, max_tokens=5, extract_activations=True)
+out = llm.generate(['Hello'], sp)
+act = out[0].outputs[0].activations
+assert act is not None, 'No activations'
+assert set(act.keys()) == set(ALL_LAYERS), f'Missing layers: {set(ALL_LAYERS) - set(act.keys())}'
+for idx in ALL_LAYERS:
+    assert torch.isfinite(act[idx]).all(), f'Layer {idx} has NaN/Inf'
+print(f'All {len(act)} layers extracted successfully')
+print('PASS: all layers extraction')
+"
+```
+
+### 4.6 Empty prompt
+
+```bash
+python -c "
+from vllm import LLM
+from vllm.sampling_params import SamplingParams
+
+llm = LLM(
+    model='google/gemma-3-270m-it',
+    max_model_len=512,
+    enforce_eager=True,
+    extract_activation_layers=[5],
+)
+sp = SamplingParams(max_tokens=5, extract_activations=True)
+try:
+    out = llm.generate([''], sp)
+    print(f'Generated: {out[0].outputs[0].text!r}')
+    act = out[0].outputs[0].activations
+    print(f'Activations: {\"present\" if act else \"None\"}')
+    print('OBSERVATION: empty prompt handled without crash')
+except Exception as e:
+    print(f'OBSERVATION: empty prompt raised error: {type(e).__name__}: {e}')
+"
+```
 
 ---
 
 ## Phase 5 — Docker (if applicable)
 
-Using the project Dockerfile:
-
 ```bash
+# Build
 docker build -t vllm-activation .
-docker run --gpus all -p 8000:8000 \
-    -e VLLM_EXTRACT_ACTIVATION_LAYERS=5 \
-    vllm-activation
+
+# Run with Gemma3 + activation layers 5 and 10
+docker run --gpus all -p 8000:8000 vllm-activation \
+    --model google/gemma-3-270m-it \
+    --max-model-len 512 \
+    --enforce-eager \
+    --extract-activation-layers 5 10
 ```
 
 Then run the curl tests from Phase 2 against `http://localhost:8000`.
 
 ---
 
+## Phase 6 — Existing Test Suite
+
+Run the project's relevant existing tests to check for regressions:
+
+```bash
+# Model-specific tests (if any exist)
+python -m pytest tests/models/ -k "gemma" -x -v --timeout=600 2>&1 | tail -30
+
+# Sampling params tests
+python -m pytest tests/ -k "sampling_param" -x -v --timeout=120 2>&1 | tail -30
+
+# Test the existing activation test script (uses old API — may need updating)
+python test_activation.py --model gemma --layers 5 --max-tokens 10
+```
+
+---
+
 ## Summary Checklist
 
-| Test | Gemma3 | Qwen3 |
-|------|--------|-------|
-| Baseline (no activations) | [ ] | [ ] |
-| Single-layer extraction | [ ] | [ ] |
-| Multi-layer extraction | [ ] | [ ] |
-| Per-request opt-in/out | [ ] | [ ] |
-| Mixed-batch slicing | [ ] | [ ] |
-| Out-of-range layer | [ ] | [ ] |
-| OpenAI chat completions | [ ] | [ ] |
-| OpenAI text completions | [ ] | [ ] |
-| Determinism | [ ] | [ ] |
-| Non-zero activations | [ ] | [ ] |
-| Different prompts → different activations | [ ] | [ ] |
-| Generation quality unchanged | [ ] | [ ] |
-| Edge cases (single token, long gen, first/last layer) | [ ] | [ ] |
-| Docker | [ ] | [ ] |
+| # | Test | Gemma3 | Qwen3 |
+|---|------|--------|-------|
+| 1.1 | Baseline (no activations) | [ ] | [ ] |
+| 1.2 | Single-layer extraction | [ ] | [ ] |
+| 1.3 | Multi-layer extraction | [ ] | [ ] |
+| 1.4 | Per-request opt-in/out | [ ] | [ ] |
+| 1.5 | Mixed-batch slicing | [ ] | [ ] |
+| 1.6 | Out-of-range layer | [ ] | [ ] |
+| 2.2 | OpenAI chat completion + activations | [ ] | [ ] |
+| 2.3 | OpenAI chat completion − activations | [ ] | [ ] |
+| 2.4 | OpenAI text completion + activations | [ ] | [ ] |
+| 3.1 | Determinism | [ ] | [ ] |
+| 3.2 | Non-zero activations | [ ] | [ ] |
+| 3.3 | Different prompts → different activations | [ ] | [ ] |
+| 3.4 | Generation quality unchanged | [ ] | [ ] |
+| 4.1 | Single token (`max_tokens=1`) | [ ] | [ ] |
+| 4.2 | Long generation (`max_tokens=256`) | [ ] | [ ] |
+| 4.3 | First layer (layer 0) | [ ] | [ ] |
+| 4.4 | Last layer (layer N-1) | [ ] | [ ] |
+| 4.5 | All layers | [ ] | [ ] |
+| 4.6 | Empty prompt | [ ] | [ ] |
+| 5 | Docker | [ ] | [ ] |
