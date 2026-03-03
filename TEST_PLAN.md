@@ -26,7 +26,7 @@ This branch adds Gemma3 support for the activation extraction feature:
 |---|---|
 | **GPU** | NVIDIA GPU with sufficient VRAM (≥4 GB for 270m, ≥8 GB for 0.6B) |
 | **Eager mode** | `enforce_eager=True` or `CompilationConfig(mode=CompilationMode.NONE)` — aux_hidden_state hooks work without CUDA graphs |
-| **Models** | `google/gemma-3-270m-it` (Gemma3, 18 layers, hidden_size=1536), `Qwen/Qwen3-0.6B` (28 layers, hidden_size=1024) |
+| **Models** | `google/gemma-3-270m-it` (Gemma3, 18 layers, hidden_size=640), `Qwen/Qwen3-0.6B` (28 layers, hidden_size=1024) |
 | **Access** | HuggingFace token set (`HF_TOKEN` env var) if gated models require it |
 
 ---
@@ -79,12 +79,20 @@ print('PASS: Qwen3 baseline')
 
 ### 1.2 Single-layer activation extraction
 
+Note on activation shapes: The aux_hidden_state mechanism captures activations from the
+**last forward step** of generation. During autoregressive decode, each step processes 1
+token, so `collected_activations[layer]` is overwritten each step. The final shape is
+`[num_tokens_in_last_step, hidden_size]`, which is typically `[1, hidden_size]` for
+decode steps. Prefill may produce `[prompt_len, hidden_size]`.
+
 ```bash
 # Gemma3 — extract layer 5
 python -c "
 import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
+
+HIDDEN_SIZE = 640  # google/gemma-3-270m-it
 
 llm = LLM(
     model='google/gemma-3-270m-it',
@@ -101,7 +109,8 @@ assert set(act.keys()) == {5}, f'Expected key {{5}}, got {set(act.keys())}'
 tensor = act[5]
 print(f'Shape: {tensor.shape}, dtype: {tensor.dtype}')
 print(f'Mean: {tensor.float().mean():.4f}, Std: {tensor.float().std():.4f}')
-assert tensor.shape[1] == 1536, f'Expected hidden_size=1536, got {tensor.shape[1]}'
+assert tensor.shape[-1] == HIDDEN_SIZE, f'Expected hidden_size={HIDDEN_SIZE}, got {tensor.shape[-1]}'
+assert tensor.ndim == 2, f'Expected 2D tensor, got {tensor.ndim}D'
 assert torch.isfinite(tensor).all(), 'Tensor contains NaN or Inf'
 assert tensor.abs().sum() > 0, 'Tensor is all zeros'
 print('PASS: Gemma3 single-layer extraction')
@@ -114,6 +123,8 @@ python -c "
 import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
+
+HIDDEN_SIZE = 1024  # Qwen/Qwen3-0.6B
 
 llm = LLM(
     model='Qwen/Qwen3-0.6B',
@@ -130,7 +141,8 @@ assert set(act.keys()) == {5}, f'Expected key {{5}}, got {set(act.keys())}'
 tensor = act[5]
 print(f'Shape: {tensor.shape}, dtype: {tensor.dtype}')
 print(f'Mean: {tensor.float().mean():.4f}, Std: {tensor.float().std():.4f}')
-assert tensor.shape[1] == 1024, f'Expected hidden_size=1024, got {tensor.shape[1]}'
+assert tensor.shape[-1] == HIDDEN_SIZE, f'Expected hidden_size={HIDDEN_SIZE}, got {tensor.shape[-1]}'
+assert tensor.ndim == 2, f'Expected 2D tensor, got {tensor.ndim}D'
 assert torch.isfinite(tensor).all(), 'Tensor contains NaN or Inf'
 assert tensor.abs().sum() > 0, 'Tensor is all zeros'
 print('PASS: Qwen3 single-layer extraction')
@@ -139,7 +151,8 @@ print('PASS: Qwen3 single-layer extraction')
 
 **Check**:
 - `activations` dict has exactly one key: `5`
-- Tensor shape: `[num_tokens, hidden_size]` where hidden_size is 1536 (Gemma3) / 1024 (Qwen3)
+- Tensor shape: `[num_tokens, hidden_size]` where hidden_size is 640 (Gemma3) / 1024 (Qwen3)
+- `num_tokens` is the number of tokens in the last forward step (typically 1 during decode)
 - No NaN/Inf, not all zeros
 
 ---
@@ -154,6 +167,8 @@ from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
 LAYERS = [0, 5, 10, 17]
+HIDDEN_SIZE = 640  # google/gemma-3-270m-it
+
 llm = LLM(
     model='google/gemma-3-270m-it',
     max_model_len=512,
@@ -170,9 +185,9 @@ shapes = {k: v.shape for k, v in act.items()}
 print(f'Layer shapes: {shapes}')
 
 # All should have same hidden_size and same num_tokens
-hidden_sizes = set(v.shape[1] for v in act.values())
+hidden_sizes = set(v.shape[-1] for v in act.values())
 num_tokens   = set(v.shape[0] for v in act.values())
-assert len(hidden_sizes) == 1, f'Inconsistent hidden sizes: {hidden_sizes}'
+assert hidden_sizes == {HIDDEN_SIZE}, f'Expected hidden_size={HIDDEN_SIZE}, got {hidden_sizes}'
 assert len(num_tokens) == 1, f'Inconsistent token counts: {num_tokens}'
 
 # First vs last layer should differ
@@ -192,6 +207,8 @@ from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
 LAYERS = [0, 5, 14, 27]
+HIDDEN_SIZE = 1024  # Qwen/Qwen3-0.6B
+
 llm = LLM(
     model='Qwen/Qwen3-0.6B',
     max_model_len=512,
@@ -207,9 +224,9 @@ assert set(act.keys()) == set(LAYERS), f'Expected {set(LAYERS)}, got {set(act.ke
 shapes = {k: v.shape for k, v in act.items()}
 print(f'Layer shapes: {shapes}')
 
-hidden_sizes = set(v.shape[1] for v in act.values())
+hidden_sizes = set(v.shape[-1] for v in act.values())
 num_tokens   = set(v.shape[0] for v in act.values())
-assert len(hidden_sizes) == 1, f'Inconsistent hidden sizes: {hidden_sizes}'
+assert hidden_sizes == {HIDDEN_SIZE}, f'Expected hidden_size={HIDDEN_SIZE}, got {hidden_sizes}'
 assert len(num_tokens) == 1, f'Inconsistent token counts: {num_tokens}'
 assert not torch.allclose(act[0].float(), act[27].float()), 'Layer 0 and 27 are identical'
 for k, v in act.items():
@@ -309,10 +326,8 @@ act_2 = outputs[2].outputs[0].activations[5]
 print(f'Request 0 activation shape: {act_0.shape}')
 print(f'Request 2 activation shape: {act_2.shape}')
 
-# Token count should be <= max_tokens (could be less if EOS hit early)
-assert act_0.shape[0] <= 8, f'Request 0: expected <=8 tokens, got {act_0.shape[0]}'
-assert act_2.shape[0] <= 8, f'Request 2: expected <=8 tokens, got {act_2.shape[0]}'
-assert act_0.shape[1] == 1536, f'Wrong hidden size: {act_0.shape[1]}'
+assert act_0.shape[-1] == 640, f'Wrong hidden size: {act_0.shape[-1]}'
+assert act_2.shape[-1] == 640, f'Wrong hidden size: {act_2.shape[-1]}'
 print('PASS: Gemma3 mixed-batch slicing')
 "
 ```
@@ -343,7 +358,7 @@ assert outputs[1].outputs[0].activations is None,     'Request 1 should NOT have
 assert outputs[2].outputs[0].activations is not None, 'Request 2 should have activations'
 act_0 = outputs[0].outputs[0].activations[5]
 print(f'Request 0 activation shape: {act_0.shape}')
-assert act_0.shape[1] == 1024, f'Wrong hidden size: {act_0.shape[1]}'
+assert act_0.shape[-1] == 1024, f'Wrong hidden size: {act_0.shape[-1]}'
 print('PASS: Qwen3 mixed-batch slicing')
 "
 ```
