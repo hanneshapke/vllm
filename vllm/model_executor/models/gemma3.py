@@ -371,6 +371,12 @@ class Gemma3Model(nn.Module):
                 residual,
                 **kwargs,
             )
+        # Capture output of the last layer if requested.  The in-loop check
+        # only fires BEFORE each layer, so aux_idx == num_layers can never
+        # match inside the loop.  Handle it here instead.
+        last_aux_idx = self.end_layer - self.start_layer
+        if last_aux_idx in self.aux_hidden_state_layers:
+            aux_hidden_states.append(hidden_states + residual)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
