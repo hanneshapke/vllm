@@ -14,6 +14,8 @@ Usage:
 
 import argparse
 
+import torch
+
 from vllm import LLM
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.sampling_params import SamplingParams
@@ -64,6 +66,11 @@ def main():
     prompts = ["What is the capital of France?"]
     outputs = llm.generate(prompts, sampling_params)
 
+    cfg = llm.llm_engine.model_config.hf_text_config
+    hidden_size = cfg.hidden_size
+    num_layers = cfg.num_hidden_layers
+    print(f"Model hidden_size={hidden_size}, num_hidden_layers={num_layers}")
+
     for output in outputs:
         print(f"\nPrompt: {output.prompt}")
         print(f"Generated: {output.outputs[0].text}")
@@ -79,6 +86,14 @@ def main():
                     f"mean={act.float().mean():.4f}, "
                     f"std={act.float().std():.4f}"
                 )
+                assert act.shape[-1] == hidden_size, (
+                    f"Layer {layer_idx}: expected hidden_size={hidden_size}, "
+                    f"got {act.shape[-1]}"
+                )
+                assert act.ndim == 2, f"Expected 2D tensor, got {act.ndim}D"
+                assert torch.isfinite(act).all(), f"Layer {layer_idx} has NaN/Inf"
+                assert act.abs().sum() > 0, f"Layer {layer_idx} is all zeros"
+            print("PASS: all activation checks passed")
         else:
             print("No activations returned")
 

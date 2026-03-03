@@ -26,7 +26,7 @@ This branch adds Gemma3 support for the activation extraction feature:
 |---|---|
 | **GPU** | NVIDIA GPU with sufficient VRAM (≥4 GB for 270m, ≥8 GB for 0.6B) |
 | **Eager mode** | `enforce_eager=True` or `CompilationConfig(mode=CompilationMode.NONE)` — aux_hidden_state hooks work without CUDA graphs |
-| **Models** | `google/gemma-3-270m-it` (Gemma3, 18 layers, hidden_size=640), `Qwen/Qwen3-0.6B` (28 layers, hidden_size=1024) |
+| **Models** | Any Gemma3 variant (e.g. `google/gemma-3-270m-it`), any Qwen3 variant (e.g. `Qwen/Qwen3-0.6B`). Tests read `hidden_size` and `num_hidden_layers` dynamically from each model's config. |
 | **Access** | HuggingFace token set (`HF_TOKEN` env var) if gated models require it |
 
 ---
@@ -92,14 +92,15 @@ import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
-HIDDEN_SIZE = 640  # google/gemma-3-270m-it
+MODEL = 'google/gemma-3-270m-it'
 
 llm = LLM(
-    model='google/gemma-3-270m-it',
+    model=MODEL,
     max_model_len=512,
     enforce_eager=True,
     extract_activation_layers=[5],
 )
+HIDDEN_SIZE = llm.llm_engine.model_config.hf_text_config.hidden_size
 sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
 out = llm.generate(['What is the capital of France?'], sp)
 act = out[0].outputs[0].activations
@@ -124,14 +125,15 @@ import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
-HIDDEN_SIZE = 1024  # Qwen/Qwen3-0.6B
+MODEL = 'Qwen/Qwen3-0.6B'
 
 llm = LLM(
-    model='Qwen/Qwen3-0.6B',
+    model=MODEL,
     max_model_len=512,
     enforce_eager=True,
     extract_activation_layers=[5],
 )
+HIDDEN_SIZE = llm.llm_engine.model_config.hf_text_config.hidden_size
 sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
 out = llm.generate(['What is the capital of France?'], sp)
 act = out[0].outputs[0].activations
@@ -151,7 +153,7 @@ print('PASS: Qwen3 single-layer extraction')
 
 **Check**:
 - `activations` dict has exactly one key: `5`
-- Tensor shape: `[num_tokens, hidden_size]` where hidden_size is 640 (Gemma3) / 1024 (Qwen3)
+- Tensor shape: `[num_tokens, hidden_size]` where hidden_size is read from the model config
 - `num_tokens` is the number of tokens in the last forward step (typically 1 during decode)
 - No NaN/Inf, not all zeros
 
@@ -166,11 +168,22 @@ import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
-LAYERS = [0, 5, 10, 17]
-HIDDEN_SIZE = 640  # google/gemma-3-270m-it
+MODEL = 'google/gemma-3-270m-it'
 
 llm = LLM(
-    model='google/gemma-3-270m-it',
+    model=MODEL,
+    max_model_len=512,
+    enforce_eager=True,
+)
+cfg = llm.llm_engine.model_config.hf_text_config
+HIDDEN_SIZE = cfg.hidden_size
+N_LAYERS = cfg.num_hidden_layers
+LAYERS = [0, 5, min(10, N_LAYERS - 1), N_LAYERS - 1]
+
+# Reinitialize with activation layers (need to set at construction time)
+del llm
+llm = LLM(
+    model=MODEL,
     max_model_len=512,
     enforce_eager=True,
     extract_activation_layers=LAYERS,
@@ -191,7 +204,8 @@ assert hidden_sizes == {HIDDEN_SIZE}, f'Expected hidden_size={HIDDEN_SIZE}, got 
 assert len(num_tokens) == 1, f'Inconsistent token counts: {num_tokens}'
 
 # First vs last layer should differ
-assert not torch.allclose(act[0].float(), act[17].float()), 'Layer 0 and 17 are identical'
+first, last = LAYERS[0], LAYERS[-1]
+assert not torch.allclose(act[first].float(), act[last].float()), f'Layer {first} and {last} are identical'
 for k, v in act.items():
     assert torch.isfinite(v).all(), f'Layer {k} has NaN/Inf'
     assert v.abs().sum() > 0, f'Layer {k} is all zeros'
@@ -206,11 +220,21 @@ import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
-LAYERS = [0, 5, 14, 27]
-HIDDEN_SIZE = 1024  # Qwen/Qwen3-0.6B
+MODEL = 'Qwen/Qwen3-0.6B'
 
 llm = LLM(
-    model='Qwen/Qwen3-0.6B',
+    model=MODEL,
+    max_model_len=512,
+    enforce_eager=True,
+)
+cfg = llm.llm_engine.model_config.hf_text_config
+HIDDEN_SIZE = cfg.hidden_size
+N_LAYERS = cfg.num_hidden_layers
+LAYERS = [0, 5, N_LAYERS // 2, N_LAYERS - 1]
+
+del llm
+llm = LLM(
+    model=MODEL,
     max_model_len=512,
     enforce_eager=True,
     extract_activation_layers=LAYERS,
@@ -228,7 +252,8 @@ hidden_sizes = set(v.shape[-1] for v in act.values())
 num_tokens   = set(v.shape[0] for v in act.values())
 assert hidden_sizes == {HIDDEN_SIZE}, f'Expected hidden_size={HIDDEN_SIZE}, got {hidden_sizes}'
 assert len(num_tokens) == 1, f'Inconsistent token counts: {num_tokens}'
-assert not torch.allclose(act[0].float(), act[27].float()), 'Layer 0 and 27 are identical'
+first, last = LAYERS[0], LAYERS[-1]
+assert not torch.allclose(act[first].float(), act[last].float()), f'Layer {first} and {last} are identical'
 for k, v in act.items():
     assert torch.isfinite(v).all(), f'Layer {k} has NaN/Inf'
 print('PASS: Qwen3 multi-layer extraction')
@@ -321,13 +346,14 @@ assert outputs[0].outputs[0].activations is not None, 'Request 0 should have act
 assert outputs[1].outputs[0].activations is None,     'Request 1 should NOT have activations'
 assert outputs[2].outputs[0].activations is not None, 'Request 2 should have activations'
 
+HIDDEN_SIZE = llm.llm_engine.model_config.hf_text_config.hidden_size
 act_0 = outputs[0].outputs[0].activations[5]
 act_2 = outputs[2].outputs[0].activations[5]
 print(f'Request 0 activation shape: {act_0.shape}')
 print(f'Request 2 activation shape: {act_2.shape}')
 
-assert act_0.shape[-1] == 640, f'Wrong hidden size: {act_0.shape[-1]}'
-assert act_2.shape[-1] == 640, f'Wrong hidden size: {act_2.shape[-1]}'
+assert act_0.shape[-1] == HIDDEN_SIZE, f'Wrong hidden size: {act_0.shape[-1]}'
+assert act_2.shape[-1] == HIDDEN_SIZE, f'Wrong hidden size: {act_2.shape[-1]}'
 print('PASS: Gemma3 mixed-batch slicing')
 "
 ```
@@ -356,9 +382,10 @@ outputs = llm.generate(
 assert outputs[0].outputs[0].activations is not None, 'Request 0 should have activations'
 assert outputs[1].outputs[0].activations is None,     'Request 1 should NOT have activations'
 assert outputs[2].outputs[0].activations is not None, 'Request 2 should have activations'
+HIDDEN_SIZE = llm.llm_engine.model_config.hf_text_config.hidden_size
 act_0 = outputs[0].outputs[0].activations[5]
 print(f'Request 0 activation shape: {act_0.shape}')
-assert act_0.shape[-1] == 1024, f'Wrong hidden size: {act_0.shape[-1]}'
+assert act_0.shape[-1] == HIDDEN_SIZE, f'Wrong hidden size: {act_0.shape[-1]}'
 print('PASS: Qwen3 mixed-batch slicing')
 "
 ```
@@ -527,11 +554,16 @@ import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
+MODEL = 'google/gemma-3-270m-it'
+llm = LLM(model=MODEL, max_model_len=512, enforce_eager=True)
+N_LAYERS = llm.llm_engine.model_config.hf_text_config.num_hidden_layers
+del llm
+
 llm = LLM(
-    model='google/gemma-3-270m-it',
+    model=MODEL,
     max_model_len=512,
     enforce_eager=True,
-    extract_activation_layers=[0, 5, 17],
+    extract_activation_layers=[0, 5, N_LAYERS - 1],
 )
 sp = SamplingParams(temperature=0, max_tokens=10, extract_activations=True)
 out = llm.generate(['Hello world'], sp)
@@ -686,7 +718,7 @@ print('PASS: first layer extraction')
 "
 ```
 
-### 4.4 Last layer (layer 17 for Gemma3)
+### 4.4 Last layer
 
 ```bash
 python -c "
@@ -694,23 +726,28 @@ import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
+MODEL = 'google/gemma-3-270m-it'
+llm = LLM(model=MODEL, max_model_len=512, enforce_eager=True)
+LAST = llm.llm_engine.model_config.hf_text_config.num_hidden_layers - 1
+del llm
+
 llm = LLM(
-    model='google/gemma-3-270m-it',
+    model=MODEL,
     max_model_len=512,
     enforce_eager=True,
-    extract_activation_layers=[17],
+    extract_activation_layers=[LAST],
 )
 sp = SamplingParams(temperature=0, max_tokens=5, extract_activations=True)
 out = llm.generate(['Hello'], sp)
 act = out[0].outputs[0].activations
-assert act is not None and 17 in act, 'Layer 17 not in activations'
-assert torch.isfinite(act[17]).all(), 'Layer 17 has NaN/Inf'
-print(f'Layer 17 shape: {act[17].shape}')
+assert act is not None and LAST in act, f'Layer {LAST} not in activations'
+assert torch.isfinite(act[LAST]).all(), f'Layer {LAST} has NaN/Inf'
+print(f'Layer {LAST} shape: {act[LAST].shape}')
 print('PASS: last layer extraction')
 "
 ```
 
-### 4.5 All layers (0..17 for Gemma3)
+### 4.5 All layers
 
 ```bash
 python -c "
@@ -718,9 +755,14 @@ import torch
 from vllm import LLM
 from vllm.sampling_params import SamplingParams
 
-ALL_LAYERS = list(range(18))
+MODEL = 'google/gemma-3-270m-it'
+llm = LLM(model=MODEL, max_model_len=512, enforce_eager=True)
+N_LAYERS = llm.llm_engine.model_config.hf_text_config.num_hidden_layers
+del llm
+
+ALL_LAYERS = list(range(N_LAYERS))
 llm = LLM(
-    model='google/gemma-3-270m-it',
+    model=MODEL,
     max_model_len=512,
     enforce_eager=True,
     extract_activation_layers=ALL_LAYERS,
