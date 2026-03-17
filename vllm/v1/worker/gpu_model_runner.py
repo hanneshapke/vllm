@@ -3587,6 +3587,16 @@ class GPUModelRunner(
                     positions = self.extract_activation_positions
                     for aux_idx, pos in positions.items():
                         orig_layer = extract_layer_map[aux_idx]
+                        if pos >= len(aux_hidden_states):
+                            logger.warning(
+                                "Skipping activation layer %d: "
+                                "aux_hidden_states has %d entries "
+                                "but need position %d",
+                                orig_layer,
+                                len(aux_hidden_states),
+                                pos,
+                            )
+                            continue
                         act = aux_hidden_states[pos]
                         logger.debug(
                             "Activation layer %d (aux_idx=%d, pos=%d): "
