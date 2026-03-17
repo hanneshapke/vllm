@@ -613,6 +613,12 @@ class Gemma3ForConditionalGeneration(
             handle_oov_mm_token=handle_oov_mm_token,
         )
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return self.language_model.get_eagle3_aux_hidden_state_layers()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,

@@ -156,6 +156,10 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
+    # Activations from intermediate layers during inference.
+    # Serialized via MsgpackEncoder/Decoder which support torch.Tensor.
+    activations: dict[int, torch.Tensor] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

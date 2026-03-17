@@ -25,6 +25,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     UsageInfo,
+    _serialize_activations,
 )
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
@@ -578,6 +579,9 @@ class OpenAIServingCompletion(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
+                    activations=_serialize_activations(output.activations)
+                    if request.extract_activations
+                    else None,
                 )
                 choices.append(choice_data)
 

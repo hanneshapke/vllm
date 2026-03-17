@@ -342,6 +342,14 @@ class StepDecoderModel(nn.Module):
                     aux_hidden_states.append(hidden_states + residual)
             hidden_states, residual = layer(positions, hidden_states, residual)
 
+        # Capture output of the last layer if requested.
+        last_aux_idx = self.end_layer - self.start_layer
+        if last_aux_idx in self.aux_hidden_state_layers:
+            if residual is None:
+                aux_hidden_states.append(hidden_states)
+            else:
+                aux_hidden_states.append(hidden_states + residual)
+
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}

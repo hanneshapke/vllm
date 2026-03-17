@@ -93,6 +93,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
+    activations: dict[str, list[float]] | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -348,6 +349,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    extract_activations: bool = Field(
+        default=False,
+        description=(
+            "Whether to extract hidden-state activations. "
+            "Layers are configured at startup via --extract-activation-layers. "
+            "If true, the response includes an activations field."
+        ),
+    )
+
     # --8<-- [end:chat-completion-extra-params]
 
     def build_chat_params(
@@ -483,7 +493,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
-        return SamplingParams.from_optional(
+        sampling_params = SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
             frequency_penalty=self.frequency_penalty,
@@ -517,6 +527,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
         )
+        if self.extract_activations:
+            sampling_params.extract_activations = True
+        return sampling_params
 
     @model_validator(mode="before")
     @classmethod
